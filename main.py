@@ -31,7 +31,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 
-JOIN_WINDOW_SECONDS = 30 * 24 * 60 * 60  # 30 days
+JOIN_WINDOW_SECONDS = 2 * 24 * 60 * 60    # 2 days
 
 class Utils:
     # ... (keep all Utils methods same as before) ...
