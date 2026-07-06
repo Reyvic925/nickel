@@ -1,7 +1,7 @@
 import logging, os, datetime, time, json, threading, requests, httpx, tls_client
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ---------- Read configuration from environment variables (for Render) ----------
+# ---------- Read configuration ----------
 if 'DISCORD_TOKEN' in os.environ:
     token = os.environ.get('DISCORD_TOKEN')
     guildId = os.environ.get('DISCORD_GUILD_ID')
@@ -31,10 +31,12 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 
-# ---------- Constants ----------
-JOIN_WINDOW_SECONDS = 30 * 24 * 60 * 60   # 30 days (change this to whatever you want)
+JOIN_WINDOW_SECONDS = 30 * 24 * 60 * 60  # 30 days
 
 class Utils:
+    # ... (keep all Utils methods same as before) ...
+    # I'll keep them for brevity – copy from your previous script.
+
     def rangeCorrector(ranges):
         if [0, 99] not in ranges:
             ranges.insert(0, [0, 99])
@@ -100,7 +102,7 @@ class DiscordSocket(websocket.WebSocketApp):
         )
         self.endScraping = False
         self.guilds = {}
-        self.members = {}
+        self.members = {}  # user_id -> (tag, joined_at or None)
         self.ranges = [[0, 0]]
         self.lastRange = 0
         self.packets_recv = 0
@@ -184,7 +186,9 @@ class DiscordSocket(websocket.WebSocketApp):
                                         tag = f"{username}#{discrim}"
                                     else:
                                         tag = f"@{username}"
-                                    self.members[user_id] = tag
+                                    # Extract joined_at if available
+                                    joined_at = mem.get('joined_at')
+                                    self.members[user_id] = (tag, joined_at)
 
                         elif index == "UPDATE":
                             for item in updates:
@@ -208,7 +212,8 @@ class DiscordSocket(websocket.WebSocketApp):
                                         tag = f"{username}#{discrim}"
                                     else:
                                         tag = f"@{username}"
-                                    self.members[user_id] = tag
+                                    joined_at = mem.get('joined_at')
+                                    self.members[user_id] = (tag, joined_at)
 
                         self.lastRange += 1
                         self.ranges = Utils.getRanges(self.lastRange, 100, self.guilds.get(self.guild_id, {}).get("member_count", 0))
@@ -254,23 +259,18 @@ def session(token):
     })
     return sess
 
-
 def send_webhook(member_id, join_time, tag):
-    """Send webhook using the tag we already have (no user API call)."""
     try:
         sess = session(token)
         guild_resp = sess.get(f'https://discord.com/api/v9/guilds/{guildId}')
         guild_name = guild_resp.json().get('name', 'Unknown')
-
         if tag.startswith('@'):
             clean_username = tag[1:]
         elif '#' in tag:
             clean_username = tag.split('#')[0]
         else:
             clean_username = tag
-
         join_str = join_time.strftime("%m-%d-%Y on %I:%M %p")
-
         payload = {
             "content": f"@here New User Joined {guildId}",
             "embeds": [{
@@ -291,52 +291,29 @@ def send_webhook(member_id, join_time, tag):
     except Exception as e:
         logging.error("Webhook failed for %s: %s", member_id, e)
 
-
 def process_new_members(new_members_dict, token):
+    """new_members_dict: user_id -> (tag, joined_at or None)"""
     if not new_members_dict:
         return
 
     total = len(new_members_dict)
-    logging.info("Processing %s new members with parallel workers (3 at a time)...", total)
+    logging.info("Processing %s new members...", total)
 
-    progress_lock = threading.Lock()
-    processed_count = 0
-    semaphore = threading.Semaphore(3)
-
-    def process_one(member_id, tag):
-        nonlocal processed_count
-        with semaphore:
-            try:
-                sess = session(token)
-                resp = sess.get(f'https://discord.com/api/v9/guilds/{guildId}/members/{member_id}')
-                if resp.status_code != 200:
-                    logging.warning("Member %s not found or API error (status %s)", member_id, resp.status_code)
-                    return
-                join_date = resp.json().get('joined_at')
-                if not join_date:
-                    return
-                join_time = datetime.datetime.fromisoformat(join_date)
-                now = datetime.datetime.now(datetime.timezone.utc)
-                age = (now - join_time).total_seconds()
-                age_days = round(age / 86400, 1)
-                logging.info("Member %s (%s) joined %.1f days ago (window: %.0f days)", 
-                             member_id, tag, age_days, JOIN_WINDOW_SECONDS/86400)
-                if age <= JOIN_WINDOW_SECONDS:
-                    logging.info("✅ New member (within %.0f days): %s", JOIN_WINDOW_SECONDS/86400, member_id)
-                    send_webhook(member_id, join_time, tag)
-                time.sleep(0.1)
-            except Exception as e:
-                logging.warning("Error processing %s: %s", member_id, e)
-            finally:
-                with progress_lock:
-                    processed_count += 1
-                    if processed_count % 100 == 0:
-                        logging.info("Checked %s/%s new members.", processed_count, total)
-
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = [executor.submit(process_one, mid, tag) for mid, tag in new_members_dict.items()]
-        for future in as_completed(futures):
-            future.result()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for member_id, (tag, joined_at) in new_members_dict.items():
+        if not joined_at:
+            logging.debug("Member %s has no joined_at, skipping", member_id)
+            continue
+        try:
+            join_time = datetime.datetime.fromisoformat(joined_at.replace('Z', '+00:00'))
+            age = (now - join_time).total_seconds()
+            if age <= JOIN_WINDOW_SECONDS:
+                logging.info("✅ New member (within %.0f days): %s (%s)", JOIN_WINDOW_SECONDS/86400, member_id, tag)
+                send_webhook(member_id, join_time, tag)
+            else:
+                logging.debug("Member %s joined %.1f days ago – skipped", member_id, age/86400)
+        except Exception as e:
+            logging.warning("Error processing %s: %s", member_id, e)
 
     logging.info("Finished processing %s new members.", total)
 
@@ -344,6 +321,7 @@ def process_new_members(new_members_dict, token):
 if __name__ == '__main__':
     logging.info("Starting scraper (10s interval, %.0f-day join window)...", JOIN_WINDOW_SECONDS/86400)
 
+    # HTTP server for keep-alive
     try:
         from http.server import HTTPServer, BaseHTTPRequestHandler
         class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -360,21 +338,21 @@ if __name__ == '__main__':
         logging.warning("Could not start HTTP server: %s", e)
 
     logging.info("Building initial baseline...")
-    current_members = autoSnitch(token, guildId, channelId)
-    current_ids = set(current_members.keys())
+    current_members_raw = autoSnitch(token, guildId, channelId)
+    current_ids = set(current_members_raw.keys())
     logging.info("Baseline built: %s members visible.", len(current_ids))
 
-    logging.info("Checking baseline members for recent joins (within %.0f days)...", JOIN_WINDOW_SECONDS/86400)
-    process_new_members(current_members, token)
+    logging.info("Checking baseline members for recent joins...")
+    process_new_members(current_members_raw, token)
 
     while True:
-        new_members = autoSnitch(token, guildId, channelId)
-        new_ids = set(new_members.keys())
+        new_members_raw = autoSnitch(token, guildId, channelId)
+        new_ids = set(new_members_raw.keys())
         logging.info("Scanned: %s members visible.", len(new_ids))
 
         diff_ids = new_ids - current_ids
         if diff_ids:
-            diff_dict = {uid: new_members[uid] for uid in diff_ids}
+            diff_dict = {uid: new_members_raw[uid] for uid in diff_ids}
             logging.info("Found %s new IDs not in previous scan.", len(diff_dict))
             process_new_members(diff_dict, token)
 
