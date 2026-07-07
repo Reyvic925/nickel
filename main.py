@@ -316,42 +316,56 @@ def session(token):
     })
     return sess
 
-def send_webhook(member_id, join_time, tag):
-    try:
-        sess = session(token)
-        guild_resp = sess.get(f'https://discord.com/api/v9/guilds/{guildId}')
-        guild_name = guild_resp.json().get('name', 'Unknown')
-        if tag.startswith('@'):
-            clean_username = tag[1:]
-        elif '#' in tag:
-            clean_username = tag.split('#')[0]
-        else:
-            clean_username = tag
-        join_str = join_time.strftime("%m-%d-%Y on %I:%M %p")
-        payload = {
-            "content": f"@here New User Joined {guildId}",
-            "embeds": [{
-                "color": 161791,
-                "author": {"name": "Snitched Successful"},
-                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                "fields": [
-                    {"name": "Username", "value": clean_username, "inline": True},
-                    {"name": "User ID", "value": member_id, "inline": True},
-                    {"name": "Joined Server", "value": join_str, "inline": False},
-                    {"name": "Mention", "value": f"<@{member_id}>", "inline": True},
-                    {"name": "Guild", "value": guild_name, "inline": True}
-                ]
-            }]
-        }
-        logging.info(f"Sending webhook to {webhook[:60]}... for {member_id}")
-        response = requests.post(webhook, json=payload)
-        logging.info(f"Webhook response: status {response.status_code}, body: {response.text[:200]}")
-        if response.status_code == 204:
-            logging.info(f"✅ Webhook sent successfully for {member_id}")
-        else:
-            logging.error(f"❌ Webhook failed with status {response.status_code}: {response.text[:200]}")
-    except Exception as e:
-        logging.error(f"Webhook exception for {member_id}: {e}")
+def send_webhook_with_retry(member_id, join_time, tag, max_retries=3):
+    """Send webhook with exponential backoff on 429."""
+    attempt = 0
+    while attempt <= max_retries:
+        try:
+            sess = session(token)
+            guild_resp = sess.get(f'https://discord.com/api/v9/guilds/{guildId}')
+            guild_name = guild_resp.json().get('name', 'Unknown')
+            if tag.startswith('@'):
+                clean_username = tag[1:]
+            elif '#' in tag:
+                clean_username = tag.split('#')[0]
+            else:
+                clean_username = tag
+            join_str = join_time.strftime("%m-%d-%Y on %I:%M %p")
+            payload = {
+                "content": f"@here New User Joined {guildId}",
+                "embeds": [{
+                    "color": 161791,
+                    "author": {"name": "Snitched Successful"},
+                    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "fields": [
+                        {"name": "Username", "value": clean_username, "inline": True},
+                        {"name": "User ID", "value": member_id, "inline": True},
+                        {"name": "Joined Server", "value": join_str, "inline": False},
+                        {"name": "Mention", "value": f"<@{member_id}>", "inline": True},
+                        {"name": "Guild", "value": guild_name, "inline": True}
+                    ]
+                }]
+            }
+            response = requests.post(webhook, json=payload)
+            if response.status_code == 204:
+                logging.info(f"✅ Webhook sent successfully for {member_id}")
+                return
+            elif response.status_code == 429:
+                # Rate limited – wait and retry
+                retry_after = response.json().get('retry_after', 1)
+                wait_time = max(1, retry_after)
+                logging.warning(f"Webhook rate limited for {member_id}, waiting {wait_time}s...")
+                time.sleep(wait_time)
+                attempt += 1
+                continue
+            else:
+                logging.error(f"Webhook failed with status {response.status_code}: {response.text[:200]}")
+                return
+        except Exception as e:
+            logging.error(f"Webhook exception for {member_id}: {e}")
+            attempt += 1
+            time.sleep(2)
+    logging.error(f"Webhook failed after {max_retries} retries for {member_id}")
 
 def process_new_members(new_members_dict):
     if not new_members_dict:
@@ -376,9 +390,11 @@ def process_new_members(new_members_dict):
                     logging.debug("Member %s already notified, skipping.", member_id)
                     continue
                 logging.info("✅ New member (within 2 days): %s (%s)", member_id, tag)
-                send_webhook(member_id, join_time, tag)
+                send_webhook_with_retry(member_id, join_time, tag)
                 notified_members.add(member_id)
                 save_notified_cache()
+                # Delay between webhook requests to avoid rate limits
+                time.sleep(0.5)
             else:
                 logging.debug("Member %s joined %.1f days ago – skipped", member_id, age/86400)
         except Exception as e:
@@ -408,7 +424,6 @@ if __name__ == '__main__':
     except Exception as e:
         logging.warning("Could not start HTTP server: %s", e)
 
-    # Log config (masked webhook)
     webhook_mask = webhook[:40] + "..." if len(webhook) > 40 else webhook
     logging.info("Configuration: guildId=%s, channelId=%s, token starts with %s..., webhook: %s",
                  guildId, channelId, token[:8], webhook_mask)
