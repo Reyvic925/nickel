@@ -23,7 +23,6 @@ else:
     blacklistedUsers = config.get('blacklistedUsers', [])
     scan_interval = 60
 
-# Validate required values
 if not token:
     raise ValueError("DISCORD_TOKEN is not set.")
 if not guildId:
@@ -45,7 +44,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 
-# ---------- Constants ----------
 JOIN_WINDOW_SECONDS = 2 * 24 * 60 * 60
 NOTIFIED_CACHE_FILE = "notified_members.pkl"
 
@@ -137,7 +135,6 @@ class DiscordSocket(websocket.WebSocketApp):
     def scrapeUsers(self):
         if self.endScraping:
             return
-        # Build payload safely with json.dumps
         payload = {
             "op": 14,
             "d": {
@@ -151,7 +148,6 @@ class DiscordSocket(websocket.WebSocketApp):
         self.send(json.dumps(payload))
 
     def sock_open(self, ws):
-        # Use the exact identify payload that worked before (but safer: json.dumps)
         identify = {
             "op": 2,
             "d": {
@@ -347,10 +343,15 @@ def send_webhook(member_id, join_time, tag):
                 ]
             }]
         }
-        requests.post(webhook, json=payload)
-        logging.info("Webhook sent for %s", member_id)
+        logging.info(f"Sending webhook to {webhook[:60]}... for {member_id}")
+        response = requests.post(webhook, json=payload)
+        logging.info(f"Webhook response: status {response.status_code}, body: {response.text[:200]}")
+        if response.status_code == 204:
+            logging.info(f"✅ Webhook sent successfully for {member_id}")
+        else:
+            logging.error(f"❌ Webhook failed with status {response.status_code}: {response.text[:200]}")
     except Exception as e:
-        logging.error("Webhook failed for %s: %s", member_id, e)
+        logging.error(f"Webhook exception for {member_id}: {e}")
 
 def process_new_members(new_members_dict):
     if not new_members_dict:
@@ -389,7 +390,6 @@ def process_new_members(new_members_dict):
 if __name__ == '__main__':
     logging.info("Starting snitch (%ds interval, 2-day join window)...", scan_interval)
 
-    # HTTP server for Render keep-alive (with HEAD support)
     try:
         from http.server import HTTPServer, BaseHTTPRequestHandler
         class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -397,11 +397,9 @@ if __name__ == '__main__':
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(b"OK")
-
             def do_HEAD(self):
                 self.send_response(200)
                 self.end_headers()
-
         def run_http_server():
             server = HTTPServer(('0.0.0.0', int(os.environ.get('PORT', 10000))), HealthCheckHandler)
             server.serve_forever()
@@ -410,8 +408,10 @@ if __name__ == '__main__':
     except Exception as e:
         logging.warning("Could not start HTTP server: %s", e)
 
-    # Log config values to help debug
-    logging.info("Configuration: guildId=%s, channelId=%s, token starts with %s...", guildId, channelId, token[:8])
+    # Log config (masked webhook)
+    webhook_mask = webhook[:40] + "..." if len(webhook) > 40 else webhook
+    logging.info("Configuration: guildId=%s, channelId=%s, token starts with %s..., webhook: %s",
+                 guildId, channelId, token[:8], webhook_mask)
 
     logging.info("Building initial baseline...")
     current_members_raw = autoSnitch(token, guildId, channelId)
