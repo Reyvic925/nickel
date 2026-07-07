@@ -125,12 +125,11 @@ class DiscordSocket(websocket.WebSocketApp):
         self.endScraping = False
         self.guilds = {}
         self.members = {}
-        self.ranges = [[0, 0]]
-        self.online_count = 0
-        self.lastRange = 0
+        self.current_range_start = 0
         self.packets_recv = 0
 
     def run(self):
+        # Use default ping settings to avoid library errors
         self.run_forever()
         return self.members
 
@@ -144,7 +143,7 @@ class DiscordSocket(websocket.WebSocketApp):
                 "typing": True,
                 "activities": True,
                 "threads": True,
-                "channels": {self.channel_id: self.ranges}
+                "channels": {self.channel_id: [[self.current_range_start, self.current_range_start + 99]]}
             }
         }
         self.send(json.dumps(payload))
@@ -193,28 +192,27 @@ class DiscordSocket(websocket.WebSocketApp):
             return
 
     def _process_member_item(self, item):
-        """Extract and store a member if valid. Returns True if member was added."""
+        """Extract and store a member if valid."""
         if not isinstance(item, dict) or "member" not in item:
-            return False
+            return
         mem = item["member"]
         user = mem.get("user", {})
         if not user:
-            return False
+            return
         user_id = user.get("id")
         if not user_id:
-            return False
+            return
         if user.get("bot"):
-            return False
+            return
         if user_id in self.blacklisted_users:
-            return False
+            return
         if set(self.blacklisted_roles).intersection(mem.get("roles", [])):
-            return False
+            return
         username = user.get('username', 'Unknown')
         discrim = user.get('discriminator', '0')
         tag = f"{username}#{discrim}" if discrim != "0" else f"@{username}"
         joined_at = mem.get('joined_at')
         self.members[user_id] = (tag, joined_at)
-        return True
 
     def sock_message(self, ws, message):
         try:
@@ -240,36 +238,16 @@ class DiscordSocket(websocket.WebSocketApp):
                     self.guilds[guild["id"]] = {"member_count": guild.get("member_count", 0)}
 
             if t == "READY_SUPPLEMENTAL":
-                # Get online count from READY_SUPPLEMENTAL's d.guilds structure
-                supplemental_guilds = decoded.get("d", {}).get("guilds", {})
-                if isinstance(supplemental_guilds, dict):
-                    guild_data = supplemental_guilds.get(self.guild_id, {})
-                    self.online_count = guild_data.get("online_count", 0)
-                else:
-                    self.online_count = 0
-                
-                logging.info(f"Guild online count from READY_SUPPLEMENTAL: {self.online_count}")
-                
-                if self.online_count > 0:
-                    self.ranges = [[0, 99]]
-                    self.lastRange = 0
-                    self.scrapeUsers()
-                else:
-                    # Fallback: try scraping anyway with a default range
-                    logging.warning("⚠️ Online count is 0 – attempting fallback scrape.")
-                    self.ranges = [[0, 99]]
-                    self.lastRange = 0
-                    self.scrapeUsers()
+                # Start scraping from the beginning of the member list
+                self.current_range_start = 0
+                self.scrapeUsers()
 
             elif t == "GUILD_MEMBER_LIST_UPDATE":
                 parsed = Utils.parseGuildMemberListUpdate(decoded)
                 if parsed.get('guild_id') != self.guild_id:
                     return
 
-                # Update online count if provided in the update
-                if parsed.get('online_count'):
-                    self.online_count = parsed['online_count']
-
+                # Process all operations in this update
                 for elem, index in enumerate(parsed["types"]):
                     updates = parsed["updates"][elem]
                     if isinstance(updates, dict):
@@ -279,24 +257,30 @@ class DiscordSocket(websocket.WebSocketApp):
 
                     if index == "SYNC":
                         if len(updates) == 0:
+                            # Empty SYNC means we reached the end of the visible members
                             self.endScraping = True
                             break
                         
                         for item in updates:
                             self._process_member_item(item)
-
+                            
                     elif index in ("UPDATE", "INSERT"):
                         for item in updates:
                             self._process_member_item(item)
 
-                    if not self.endScraping:
-                        self.lastRange += 1
-                        self.ranges = [[self.lastRange * 100, self.lastRange * 100 + 99]]
-                        self.scrapeUsers()
-
                 if self.endScraping:
-                    logging.info(f"✅ Finished scraping. Total online members captured: {len(self.members)}")
+                    logging.info(f"✅ Finished scraping. Total members captured: {len(self.members)}")
                     self.close()
+                else:
+                    # Move to the next range of 100
+                    self.current_range_start += 100
+                    # Safety limit: don't scrape more than 5000 members to prevent abuse/timeouts
+                    if self.current_range_start >= 5000:
+                        logging.info(f"✅ Reached safety limit (5000 members). Stopping scrape.")
+                        self.endScraping = True
+                        self.close()
+                    else:
+                        self.scrapeUsers()
 
         except Exception as e:
             logging.error(f"Error in sock_message: {e}")
