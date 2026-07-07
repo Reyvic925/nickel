@@ -27,14 +27,10 @@ else:
     BATCH_SIZE = 20
     INDIVIDUAL_THRESHOLD = 5
 
-if not token:
-    raise ValueError("DISCORD_TOKEN is not set.")
-if not guildId:
-    raise ValueError("DISCORD_GUILD_ID is not set.")
-if not channelId:
-    raise ValueError("DISCORD_CHANNEL_ID is not set.")
-if not webhook:
-    raise ValueError("DISCORD_WEBHOOK is not set.")
+if not token: raise ValueError("DISCORD_TOKEN is not set.")
+if not guildId: raise ValueError("DISCORD_GUILD_ID is not set.")
+if not channelId: raise ValueError("DISCORD_CHANNEL_ID is not set.")
+if not webhook: raise ValueError("DISCORD_WEBHOOK is not set.")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,6 +51,25 @@ def save_seen_cache():
     with open(SEEN_CACHE_FILE, 'wb') as f:
         pickle.dump(seen_members, f)
 
+# ---------- Global State & Caching ----------
+api_session = None
+GUILD_NAME = "Unknown"
+
+def initialize_api_session():
+    """Fetches the guild name ONCE at startup to prevent rate limits during webhook sends."""
+    global api_session, GUILD_NAME
+    api_session = session(token)
+    try:
+        logging.info("Fetching guild info...")
+        guild_resp = api_session.get(f'https://discord.com/api/v9/guilds/{guildId}')
+        if guild_resp.status_code == 200:
+            GUILD_NAME = guild_resp.json().get('name', 'Unknown')
+            logging.info(f"Guild resolved: {GUILD_NAME}")
+        else:
+            logging.warning(f"Could not fetch guild name (Status: {guild_resp.status_code})")
+    except Exception as e:
+        logging.error(f"Error fetching guild info: {e}")
+
 # ---------- Utils ----------
 class Utils:
     def parseGuildMemberListUpdate(response):
@@ -64,27 +79,19 @@ class Utils:
             "id": response["d"]["id"],
             "guild_id": response["d"]["guild_id"],
             "hoisted_roles": response["d"]["groups"],
-            "types": [],
-            "locations": [],
-            "updates": []
+            "types": [], "locations": [], "updates": []
         }
         for chunk in response['d']['ops']:
             memberdata['types'].append(chunk['op'])
             if chunk['op'] in ('SYNC', 'INVALIDATE'):
                 memberdata['locations'].append(chunk['range'])
-                if chunk['op'] == 'SYNC':
-                    memberdata['updates'].append(chunk['items'])
-                else:
-                    memberdata['updates'].append([])
+                memberdata['updates'].append(chunk['items'] if chunk['op'] == 'SYNC' else [])
             elif chunk['op'] in ('INSERT', 'UPDATE', 'DELETE'):
                 memberdata['locations'].append(chunk['index'])
-                if chunk['op'] == 'DELETE':
-                    memberdata['updates'].append([])
-                else:
-                    memberdata['updates'].append(chunk['item'])
+                memberdata['updates'].append([] if chunk['op'] == 'DELETE' else chunk['item'])
         return memberdata
 
-# ---------- WebSocket (fixed Identify) ----------
+# ---------- WebSocket ----------
 class DiscordSocket(websocket.WebSocketApp):
     def __init__(self, token, guild_id, channel_id, on_ready=None):
         self.token = token
@@ -102,8 +109,7 @@ class DiscordSocket(websocket.WebSocketApp):
         self.socket_headers = {
             "Accept-Encoding": "gzip, deflate, br",
             "Accept-Language": "en-US,en;q=0.9",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
+            "Cache-Control": "no-cache", "Pragma": "no-cache",
             "Sec-WebSocket-Extensions": "permessage-deflate; client_max_window_bits",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         }
@@ -131,11 +137,9 @@ class DiscordSocket(websocket.WebSocketApp):
         self.run_forever(ping_interval=10, ping_timeout=5)
 
     def scrapeUsers(self):
-        if self.endScraping or not self.connected or self._scraping:
-            return
+        if self.endScraping or not self.connected or self._scraping: return
         now = time.time()
-        if now - self._last_scrape_time < 0.5:
-            return
+        if now - self._last_scrape_time < 0.5: return
         self._last_scrape_time = now
         self._scraping = True
 
@@ -144,10 +148,7 @@ class DiscordSocket(websocket.WebSocketApp):
         payload = {
             "op": 14,
             "d": {
-                "guild_id": self.guild_id,
-                "typing": True,
-                "activities": True,
-                "threads": True,
+                "guild_id": self.guild_id, "typing": True, "activities": True, "threads": True,
                 "channels": {self.channel_id: self.ranges}
             }
         }
@@ -155,49 +156,31 @@ class DiscordSocket(websocket.WebSocketApp):
         self.send(json.dumps(payload))
         threading.Timer(0.2, self._reset_scraping).start()
 
-    def _reset_scraping(self):
-        self._scraping = False
+    def _reset_scraping(self): self._scraping = False
 
     def sock_open(self, ws):
-        # Minimal, modern Identify payload
         identify = {
             "op": 2,
             "d": {
                 "token": self.token,
                 "properties": {
-                    "os": "Windows",
-                    "browser": "Chrome",
-                    "device": "",
-                    "system_locale": "en-US",
+                    "os": "Windows", "browser": "Chrome", "device": "", "system_locale": "en-US",
                     "browser_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    "browser_version": "120.0.0.0",
-                    "os_version": "10",
-                    "referrer": "",
-                    "referring_domain": "",
-                    "referrer_current": "",
-                    "referring_domain_current": "",
-                    "release_channel": "stable",
-                    "client_build_number": 99999,   # still needed for some clients, but we set a modern one
+                    "browser_version": "120.0.0.0", "os_version": "10", "referrer": "", "referring_domain": "",
+                    "referrer_current": "", "referring_domain_current": "", "release_channel": "stable",
+                    "client_build_number": 250000, # Updated to a more realistic build number
                     "client_event_source": None
                 },
-                "presence": {
-                    "status": "online",
-                    "since": 0,
-                    "activities": [],
-                    "afk": False
-                },
+                "presence": {"status": "online", "since": 0, "activities": [], "afk": False},
                 "compress": False,
                 "client_state": {
-                    "guild_hashes": {},
-                    "highest_last_message_id": "0",
-                    "read_state_version": 0,
-                    "user_guild_settings_version": -1,
-                    "user_settings_version": -1
+                    "guild_hashes": {}, "highest_last_message_id": "0", "read_state_version": 0,
+                    "user_guild_settings_version": -1, "user_settings_version": -1
                 },
-                "intents": 1 << 1   # GUILD_MEMBERS intent (required to receive member lists)
+                "intents": 1 << 1 
             }
         }
-        logging.info(f"Sending Identify: {json.dumps(identify)}")
+        logging.info(f"Sending Identify...")
         self.send(json.dumps(identify))
 
     def heartbeatThread(self, interval):
@@ -205,27 +188,19 @@ class DiscordSocket(websocket.WebSocketApp):
             while not self.endScraping and self.connected:
                 self.send('{"op":1,"d":' + str(self.packets_recv) + '}')
                 time.sleep(interval)
-        except Exception:
-            return
+        except Exception: return
 
     def sock_message(self, ws, message):
         try:
-            # Log every incoming message for debugging
-            logging.info(f"Received: {message[:200]}")  # truncate for readability
             decoded = json.loads(message)
-            if not isinstance(decoded, dict):
-                return
-
+            if not isinstance(decoded, dict): return
             op = decoded.get("op")
             t = decoded.get("t")
-
-            if op != 11:
-                self.packets_recv += 1
+            if op != 11: self.packets_recv += 1
 
             if op == 10:
                 interval = decoded["d"]["heartbeat_interval"] / 1000
-                if self.heartbeat_thread and self.heartbeat_thread.is_alive():
-                    return
+                if self.heartbeat_thread and self.heartbeat_thread.is_alive(): return
                 self.heartbeat_thread = threading.Thread(target=self.heartbeatThread, args=(interval,), daemon=True)
                 self.heartbeat_thread.start()
 
@@ -241,41 +216,32 @@ class DiscordSocket(websocket.WebSocketApp):
                     self.connected = True
                     logging.info("WebSocket ready, waiting 3s before first scrape...")
                     threading.Timer(3.0, self._start_scrape).start()
-                    if self.on_ready_callback:
-                        self.on_ready_callback()
+                    if self.on_ready_callback: self.on_ready_callback()
                 else:
                     logging.warning("⚠️ Member count is 0 – cannot scrape.")
 
             elif t == "GUILD_MEMBER_LIST_UPDATE":
                 parsed = Utils.parseGuildMemberListUpdate(decoded)
-                if parsed['guild_id'] != self.guild_id:
-                    return
-
+                if parsed['guild_id'] != self.guild_id: return
                 self.total_member_count = parsed.get('member_count', self.total_member_count)
 
                 for elem, op_type in enumerate(parsed["types"]):
                     updates = parsed["updates"][elem]
-                    if isinstance(updates, dict):
-                        updates = [updates]
-                    elif not isinstance(updates, list):
-                        updates = []
+                    if isinstance(updates, dict): updates = [updates]
+                    elif not isinstance(updates, list): updates = []
 
                     if op_type in ("SYNC", "UPDATE"):
                         for item in updates:
                             if "member" in item:
                                 mem = item["member"]
                                 user = mem.get("user", {})
-                                if not user:
-                                    continue
+                                if not user: continue
                                 user_id = user.get("id")
-                                if not user_id:
-                                    continue
-                                if set(self.blacklisted_roles).intersection(mem.get("roles", [])):
-                                    continue
-                                if user.get("bot"):
-                                    continue
-                                if user_id in self.blacklisted_users:
-                                    continue
+                                if not user_id: continue
+                                if set(self.blacklisted_roles).intersection(mem.get("roles", [])): continue
+                                if user.get("bot"): continue
+                                if user_id in self.blacklisted_users: continue
+                                
                                 username = user.get('username', 'Unknown')
                                 discrim = user.get('discriminator', '0')
                                 tag = f"{username}#{discrim}" if discrim != "0" else f"@{username}"
@@ -289,7 +255,6 @@ class DiscordSocket(websocket.WebSocketApp):
                         self.close()
                     else:
                         threading.Timer(0.5, self.scrapeUsers).start()
-
         except Exception as e:
             logging.error(f"Error in sock_message: {e}")
 
@@ -297,15 +262,12 @@ class DiscordSocket(websocket.WebSocketApp):
         if self.connected and not self.endScraping and self.total_member_count > 0:
             logging.info("Initiating member list scrape...")
             self.scrapeUsers()
-        else:
-            logging.warning("Cannot start scrape – connection or member count invalid.")
 
     def sock_close(self, ws, close_code, close_msg):
         logging.warning(f"WebSocket closed: code={close_code}, msg={close_msg}")
         self.connected = False
         if not self.endScraping and self._should_reconnect:
-            if self._reconnect_timer:
-                self._reconnect_timer.cancel()
+            if self._reconnect_timer: self._reconnect_timer.cancel()
             delay = self.reconnect_delay
             self.reconnect_delay = min(self.reconnect_delay * 2, 60)
             logging.info(f"Reconnecting in {delay} seconds...")
@@ -319,14 +281,12 @@ class DiscordSocket(websocket.WebSocketApp):
                 logging.info("Attempting reconnection...")
                 threading.Thread(target=self.run, daemon=True).start()
 
-    def sock_error(self, ws, err):
-        logging.error(f"WebSocket error: {err}")
+    def sock_error(self, ws, err): logging.error(f"WebSocket error: {err}")
 
 # ---------- Helpers ----------
 def autoSnitch(token, guild_id, channel_id):
     ready_event = threading.Event()
-    def on_ready():
-        ready_event.set()
+    def on_ready(): ready_event.set()
 
     sb = DiscordSocket(token, guild_id, channel_id, on_ready=on_ready)
     thread = threading.Thread(target=sb.run, daemon=True)
@@ -337,29 +297,20 @@ def autoSnitch(token, guild_id, channel_id):
         sb._should_reconnect = False
         sb.close()
         return {}
-    while not sb.endScraping:
-        time.sleep(1)
+    while not sb.endScraping: time.sleep(1)
     sb._should_reconnect = False
     sb.close()
     return sb.members
 
 def session(token):
-    sess = tls_client.Session(client_identifier='chrome_105')
+    sess = tls_client.Session(client_identifier='chrome_120') # Updated identifier
     sess.headers.update({
-        'accept': '*/*',
-        'accept-encoding': 'application/json',
-        'accept-language': 'en-US,en;q=0.8',
-        'Content-Type': 'application/json',
-        'Authorization': token,
-        'referer': 'https://discord.com/channels/@me',
-        'sec-fetch-dest': 'empty',
-        'sec-fetch-mode': 'cors',
-        'sec-fetch-site': 'same-origin',
-        'sec-gpc': '1',
+        'accept': '*/*', 'accept-encoding': 'application/json', 'accept-language': 'en-US,en;q=0.8',
+        'Content-Type': 'application/json', 'Authorization': token, 'referer': 'https://discord.com/channels/@me',
+        'sec-fetch-dest': 'empty', 'sec-fetch-mode': 'cors', 'sec-fetch-site': 'same-origin', 'sec-gpc': '1',
         'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'x-context-properties': 'eyJsb2NhdGlvbiI6IlVzZXIgUHJvZmlsZSJ9',
-        'x-debug-options': 'bugReporterEnabled',
-        'x-discord-locale': 'en-US',
+        'x-debug-options': 'bugReporterEnabled', 'x-discord-locale': 'en-US',
         'x-super-properties': 'eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiRGlzY29yZCBDbGllbnQiLCJyZWxlYXNlX2NoYW5uZWwiOiJjYW5hcnkiLCJjbGllbnRfdmVyc2lvbiI6IjEuMC41OSIsIm9zX3ZlcnNpb24iOiIxMC4wLjIyNjIxIiwib3NfYXJjaCI6Ing2NCIsInN5c3RlbV9sb2NhbGUiOiJlbi1VUyIsImNsaWVudF9idWlsZF9udW1iZXIiOjE4MTk2NywibmF0aXZlX2J1aWxkX251bWJlciI6MzA4NTIsImNsaWVudF9ldmVudF9zb3VyY2UiOm51bGwsImRlc2lnbl9pZCI6MH0='
     })
     return sess
@@ -369,22 +320,19 @@ def send_single_webhook(member_id, tag, join_time, max_retries=3):
     wait_time = 2
     while attempt <= max_retries:
         try:
-            sess = session(token)
-            guild_resp = sess.get(f'https://discord.com/api/v9/guilds/{guildId}')
-            guild_name = guild_resp.json().get('name', 'Unknown')
+            # REMOVED: Redundant API call to fetch guild name
             clean_username = tag[1:] if tag.startswith('@') else tag.split('#')[0] if '#' in tag else tag
             join_str = join_time.strftime("%m-%d-%Y on %I:%M %p")
             payload = {
                 "content": f"<@{member_id}> just joined!",
                 "embeds": [{
-                    "color": 161791,
-                    "author": {"name": "Snitched Successful"},
+                    "color": 161791, "author": {"name": "Snitch Successful"},
                     "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                     "fields": [
                         {"name": "Username", "value": clean_username, "inline": True},
                         {"name": "User ID", "value": member_id, "inline": True},
                         {"name": "Joined Server", "value": join_str, "inline": False},
-                        {"name": "Guild", "value": guild_name, "inline": True}
+                        {"name": "Guild", "value": GUILD_NAME, "inline": True} # Uses cached name
                     ]
                 }]
             }
@@ -410,16 +358,12 @@ def send_single_webhook(member_id, tag, join_time, max_retries=3):
             time.sleep(2)
 
 def send_batch_webhook(batch, max_retries=3):
-    if not batch:
-        return
+    if not batch: return
     attempt = 0
     wait_time = 2
     while attempt <= max_retries:
         try:
-            sess = session(token)
-            guild_resp = sess.get(f'https://discord.com/api/v9/guilds/{guildId}')
-            guild_name = guild_resp.json().get('name', 'Unknown')
-
+            # REMOVED: Redundant API call to fetch guild name
             fields = []
             for item in batch:
                 member_id = item['member_id']
@@ -433,14 +377,11 @@ def send_batch_webhook(batch, max_retries=3):
                     "inline": False
                 })
             embed = {
-                "color": 161791,
-                "author": {"name": f"Snitched Successful ({len(batch)} new members)"},
+                "color": 161791, "author": {"name": f"Snitch Successful ({len(batch)} new members)"},
                 "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                "fields": fields,
-                "footer": {"text": f"Guild: {guild_name}"}
+                "fields": fields, "footer": {"text": f"Guild: {GUILD_NAME}"} # Uses cached name
             }
             payload = {"embeds": [embed]}
-
             response = requests.post(webhook, json=payload)
             if response.status_code == 204:
                 logging.info(f"✅ Batch webhook sent for {len(batch)} members.")
@@ -463,9 +404,7 @@ def send_batch_webhook(batch, max_retries=3):
             time.sleep(2)
 
 def process_new_members(new_members_dict):
-    if not new_members_dict:
-        return
-
+    if not new_members_dict: return
     now = datetime.datetime.now(datetime.timezone.utc)
     pending_notify = []
     global seen_members
@@ -478,11 +417,7 @@ def process_new_members(new_members_dict):
             join_time = datetime.datetime.fromisoformat(joined_at.replace('Z', '+00:00'))
             age = (now - join_time).total_seconds()
             if age <= JOIN_WINDOW_SECONDS:
-                pending_notify.append({
-                    'member_id': member_id,
-                    'tag': tag,
-                    'join_time': join_time
-                })
+                pending_notify.append({'member_id': member_id, 'tag': tag, 'join_time': join_time})
         except Exception as e:
             logging.warning(f"Error parsing join time for {member_id}: {e}")
         seen_members.add(member_id)
@@ -498,8 +433,7 @@ def process_new_members(new_members_dict):
             for i in range(0, len(pending_notify), BATCH_SIZE):
                 batch = pending_notify[i:i+BATCH_SIZE]
                 send_batch_webhook(batch)
-                if i + BATCH_SIZE < len(pending_notify):
-                    time.sleep(2)
+                if i + BATCH_SIZE < len(pending_notify): time.sleep(2)
 
     save_seen_cache()
     logging.info(f"✅ Finished processing. Seen members now: {len(seen_members)}")
@@ -559,6 +493,7 @@ if __name__ == '__main__':
 
     def main_loop():
         wait_for_webhook_ready()
+        initialize_api_session() # <--- Fetches Guild Name ONCE here
 
         logging.info("Building initial baseline and processing unseen members...")
         current_members = autoSnitch(token, guildId, channelId)
