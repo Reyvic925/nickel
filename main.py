@@ -93,6 +93,9 @@ class DiscordSocket(websocket.WebSocketApp):
         self.blacklisted_roles = [str(r) for r in blacklistedRoles]
         self.blacklisted_users = [str(u) for u in blacklistedUsers]
         self.on_ready_callback = on_ready
+        self.reconnect_delay = 5
+        self.reconnect_lock = threading.Lock()
+        self._should_reconnect = True
 
         self.socket_headers = {
             "Accept-Encoding": "gzip, deflate, br",
@@ -119,12 +122,14 @@ class DiscordSocket(websocket.WebSocketApp):
         self.packets_recv = 0
         self.connected = False
         self.heartbeat_thread = None
+        self._reconnect_timer = None
 
     def run(self):
+        self._should_reconnect = True
         self.run_forever(ping_interval=10, ping_timeout=5)
 
     def scrapeUsers(self):
-        if self.endScraping:
+        if self.endScraping or not self.connected:
             return
         end = self.current_start + self.chunk_size - 1
         self.ranges = [[self.current_start, end]]
@@ -138,6 +143,7 @@ class DiscordSocket(websocket.WebSocketApp):
                 "channels": {self.channel_id: self.ranges}
             }
         }
+        logging.debug(f"Sending op 14: {payload}")
         self.send(json.dumps(payload))
 
     def sock_open(self, ws):
@@ -177,7 +183,7 @@ class DiscordSocket(websocket.WebSocketApp):
 
     def heartbeatThread(self, interval):
         try:
-            while not self.endScraping:
+            while not self.endScraping and self.connected:
                 self.send('{"op":1,"d":' + str(self.packets_recv) + '}')
                 time.sleep(interval)
         except Exception:
@@ -269,35 +275,85 @@ class DiscordSocket(websocket.WebSocketApp):
     def sock_close(self, ws, close_code, close_msg):
         logging.warning(f"WebSocket closed: code={close_code}, msg={close_msg}")
         self.connected = False
-        if not self.endScraping:
-            # Reconnect after a delay
-            logging.info("Reconnecting in 5 seconds...")
-            time.sleep(5)
-            threading.Thread(target=self.run, daemon=True).start()
+        if not self.endScraping and self._should_reconnect:
+            # Cancel any pending reconnect timer
+            if self._reconnect_timer:
+                self._reconnect_timer.cancel()
+            # Schedule reconnect with exponential backoff
+            delay = self.reconnect_delay
+            self.reconnect_delay = min(self.reconnect_delay * 2, 60)  # max 60s
+            logging.info(f"Reconnecting in {delay} seconds...")
+            self._reconnect_timer = threading.Timer(delay, self._reconnect)
+            self._reconnect_timer.daemon = True
+            self._reconnect_timer.start()
+
+    def _reconnect(self):
+        with self.reconnect_lock:
+            if self._should_reconnect and not self.connected:
+                logging.info("Attempting reconnection...")
+                threading.Thread(target=self.run, daemon=True).start()
 
     def sock_error(self, ws, err):
         logging.error(f"WebSocket error: {err}")
 
 # ---------- Helpers ----------
+def get_voice_channel_id(guild_id, token):
+    """Fetch a voice channel ID from the guild using REST API."""
+    sess = tls_client.Session(client_identifier='chrome_105')
+    sess.headers.update({
+        'Authorization': token,
+        'Content-Type': 'application/json',
+    })
+    resp = sess.get(f'https://discord.com/api/v9/guilds/{guild_id}/channels')
+    if resp.status_code != 200:
+        logging.error(f"Failed to fetch channels: {resp.status_code}")
+        return None
+    channels = resp.json()
+    for ch in channels:
+        if ch.get('type') == 2:  # 2 = voice channel
+            return str(ch['id'])
+    return None
+
 def autoSnitch(token, guild_id, channel_id):
-    # Wait for the socket to finish scraping
+    # Verify channel is a voice channel, if not try to find one
+    actual_channel = channel_id
+    # Quick REST check to see if channel is voice
+    sess = tls_client.Session(client_identifier='chrome_105')
+    sess.headers.update({'Authorization': token})
+    ch_resp = sess.get(f'https://discord.com/api/v9/channels/{channel_id}')
+    if ch_resp.status_code == 200:
+        ch_data = ch_resp.json()
+        if ch_data.get('type') != 2:  # not voice
+            logging.warning(f"Channel {channel_id} is not a voice channel (type={ch_data.get('type')}). Trying to find a voice channel...")
+            voice_ch = get_voice_channel_id(guild_id, token)
+            if voice_ch:
+                actual_channel = voice_ch
+                logging.info(f"Using voice channel {actual_channel} instead.")
+            else:
+                logging.error("No voice channel found. Please set DISCORD_CHANNEL_ID to a voice channel.")
+                return {}
+    else:
+        logging.warning(f"Could not fetch channel info, using provided ID anyway.")
+
     ready_event = threading.Event()
     def on_ready():
         ready_event.set()
 
-    sb = DiscordSocket(token, guild_id, channel_id, on_ready=on_ready)
-    # Run in a separate thread so we can wait
+    sb = DiscordSocket(token, guild_id, actual_channel, on_ready=on_ready)
     thread = threading.Thread(target=sb.run, daemon=True)
     thread.start()
-    # Wait until READY_SUPPLEMENTAL is received (or timeout)
+    # Wait for ready
     ready_event.wait(timeout=30)
     if not ready_event.is_set():
         logging.warning("Initial ready timeout, closing socket.")
+        sb._should_reconnect = False
         sb.close()
         return {}
     # Wait for scraping to complete
     while not sb.endScraping:
         time.sleep(1)
+    sb._should_reconnect = False
+    sb.close()
     return sb.members
 
 def session(token):
@@ -518,10 +574,8 @@ if __name__ == '__main__':
 
     # 3. Run everything else in a background thread
     def main_loop():
-        # Check webhook (non‑blocking)
         wait_for_webhook_ready()
 
-        # Initial baseline
         logging.info("Building initial baseline and processing unseen members...")
         current_members = autoSnitch(token, guildId, channelId)
         logging.info("Scanned %s members.", len(current_members))
@@ -533,7 +587,6 @@ if __name__ == '__main__':
         else:
             logging.info("No new members found in baseline.")
 
-        # Main scan loop
         while True:
             current_members = autoSnitch(token, guildId, channelId)
             logging.info("Scanned %s members.", len(current_members))
