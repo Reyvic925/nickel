@@ -1,5 +1,5 @@
 import logging, os, datetime, time, json, threading, requests, tls_client, pickle
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import websocket
 
 # ---------- Read configuration ----------
 if 'DISCORD_TOKEN' in os.environ:
@@ -36,12 +36,6 @@ if not channelId:
 if not webhook:
     raise ValueError("DISCORD_WEBHOOK is not set.")
 
-try:
-    import websocket
-except:
-    os.system("pip install websocket-client")
-    import websocket
-
 logging.basicConfig(
     level=logging.INFO,
     format="\x1b[38;5;9m[\x1b[0m%(asctime)s\x1b[38;5;9m]\x1b[0m %(message)s\x1b[0m",
@@ -51,7 +45,6 @@ logging.basicConfig(
 JOIN_WINDOW_SECONDS = 2 * 24 * 60 * 60
 SEEN_CACHE_FILE = "seen_members.pkl"
 
-# Load seen members cache (all IDs we have ever encountered)
 if os.path.exists(SEEN_CACHE_FILE):
     with open(SEEN_CACHE_FILE, 'rb') as f:
         seen_members = pickle.load(f)
@@ -64,14 +57,6 @@ def save_seen_cache():
 
 # ---------- Utils ----------
 class Utils:
-    def rangeCorrector(ranges):
-        return ranges
-
-    def getRanges(index, multiplier, memberCount):
-        start = index * multiplier
-        end = start + multiplier - 1
-        return [[start, end]]
-
     def parseGuildMemberListUpdate(response):
         memberdata = {
             "online_count": response["d"]["online_count"],
@@ -99,14 +84,15 @@ class Utils:
                     memberdata['updates'].append(chunk['item'])
         return memberdata
 
-# ---------- WebSocket ----------
+# ---------- WebSocket (with auto‑reconnect) ----------
 class DiscordSocket(websocket.WebSocketApp):
-    def __init__(self, token, guild_id, channel_id):
+    def __init__(self, token, guild_id, channel_id, on_ready=None):
         self.token = token
         self.guild_id = guild_id
         self.channel_id = channel_id
         self.blacklisted_roles = [str(r) for r in blacklistedRoles]
         self.blacklisted_users = [str(u) for u in blacklistedUsers]
+        self.on_ready_callback = on_ready
 
         self.socket_headers = {
             "Accept-Encoding": "gzip, deflate, br",
@@ -121,7 +107,8 @@ class DiscordSocket(websocket.WebSocketApp):
             header=self.socket_headers,
             on_open=lambda ws: self.sock_open(ws),
             on_message=lambda ws, msg: self.sock_message(ws, msg),
-            on_close=lambda ws, close_code, close_msg: self.sock_close(ws, close_code, close_msg)
+            on_close=lambda ws, code, msg: self.sock_close(ws, code, msg),
+            on_error=lambda ws, err: self.sock_error(ws, err)
         )
         self.endScraping = False
         self.guilds = {}
@@ -130,10 +117,11 @@ class DiscordSocket(websocket.WebSocketApp):
         self.current_start = 0
         self.total_member_count = 0
         self.packets_recv = 0
+        self.connected = False
+        self.heartbeat_thread = None
 
     def run(self):
-        self.run_forever()
-        return self.members
+        self.run_forever(ping_interval=10, ping_timeout=5)
 
     def scrapeUsers(self):
         if self.endScraping:
@@ -189,7 +177,7 @@ class DiscordSocket(websocket.WebSocketApp):
 
     def heartbeatThread(self, interval):
         try:
-            while True:
+            while not self.endScraping:
                 self.send('{"op":1,"d":' + str(self.packets_recv) + '}')
                 time.sleep(interval)
         except Exception:
@@ -208,7 +196,11 @@ class DiscordSocket(websocket.WebSocketApp):
                 self.packets_recv += 1
 
             if op == 10:
-                threading.Thread(target=self.heartbeatThread, args=(decoded["d"]["heartbeat_interval"] / 1000,), daemon=True).start()
+                interval = decoded["d"]["heartbeat_interval"] / 1000
+                if self.heartbeat_thread and self.heartbeat_thread.is_alive():
+                    return
+                self.heartbeat_thread = threading.Thread(target=self.heartbeatThread, args=(interval,), daemon=True)
+                self.heartbeat_thread.start()
 
             if t == "READY":
                 for guild in decoded.get("d", {}).get("guilds", []):
@@ -219,6 +211,10 @@ class DiscordSocket(websocket.WebSocketApp):
                 if member_count:
                     self.total_member_count = member_count
                     self.current_start = 0
+                    self.connected = True
+                    logging.info("WebSocket ready, starting scrape.")
+                    if self.on_ready_callback:
+                        self.on_ready_callback()
                     self.scrapeUsers()
                 else:
                     logging.warning("⚠️ Member count is 0 – cannot scrape.")
@@ -271,17 +267,38 @@ class DiscordSocket(websocket.WebSocketApp):
             logging.error(f"Error in sock_message: {e}")
 
     def sock_close(self, ws, close_code, close_msg):
-        pass
+        logging.warning(f"WebSocket closed: code={close_code}, msg={close_msg}")
+        self.connected = False
+        if not self.endScraping:
+            # Reconnect after a delay
+            logging.info("Reconnecting in 5 seconds...")
+            time.sleep(5)
+            threading.Thread(target=self.run, daemon=True).start()
+
+    def sock_error(self, ws, err):
+        logging.error(f"WebSocket error: {err}")
 
 # ---------- Helpers ----------
 def autoSnitch(token, guild_id, channel_id):
-    sb = DiscordSocket(token, guild_id, channel_id)
-    return sb.run()
+    # Wait for the socket to finish scraping
+    ready_event = threading.Event()
+    def on_ready():
+        ready_event.set()
 
-def rotateProxy():
-    if proxy:
-        return {'http': 'http://%s' % proxy, 'https': 'http://%s' % proxy}
-    return None
+    sb = DiscordSocket(token, guild_id, channel_id, on_ready=on_ready)
+    # Run in a separate thread so we can wait
+    thread = threading.Thread(target=sb.run, daemon=True)
+    thread.start()
+    # Wait until READY_SUPPLEMENTAL is received (or timeout)
+    ready_event.wait(timeout=30)
+    if not ready_event.is_set():
+        logging.warning("Initial ready timeout, closing socket.")
+        sb.close()
+        return {}
+    # Wait for scraping to complete
+    while not sb.endScraping:
+        time.sleep(1)
+    return sb.members
 
 def session(token):
     sess = tls_client.Session(client_identifier='chrome_105')
@@ -304,7 +321,6 @@ def session(token):
     })
     return sess
 
-# ---------- Webhook Sending ----------
 def send_single_webhook(member_id, tag, join_time, max_retries=3):
     attempt = 0
     wait_time = 2
@@ -313,12 +329,7 @@ def send_single_webhook(member_id, tag, join_time, max_retries=3):
             sess = session(token)
             guild_resp = sess.get(f'https://discord.com/api/v9/guilds/{guildId}')
             guild_name = guild_resp.json().get('name', 'Unknown')
-            if tag.startswith('@'):
-                clean_username = tag[1:]
-            elif '#' in tag:
-                clean_username = tag.split('#')[0]
-            else:
-                clean_username = tag
+            clean_username = tag[1:] if tag.startswith('@') else tag.split('#')[0] if '#' in tag else tag
             join_str = join_time.strftime("%m-%d-%Y on %I:%M %p")
             payload = {
                 "content": f"<@{member_id}> just joined!",
@@ -339,16 +350,13 @@ def send_single_webhook(member_id, tag, join_time, max_retries=3):
                 logging.info(f"✅ Webhook sent for {member_id}")
                 return
             elif response.status_code == 429:
-                try:
-                    data = response.json()
-                    retry_after = data.get('retry_after', wait_time)
-                except:
-                    retry_after = wait_time
+                data = response.json()
+                retry_after = data.get('retry_after', wait_time)
                 wait_time = max(wait_time, retry_after)
-                logging.warning(f"Rate limited for {member_id}, waiting {wait_time}s...")
+                logging.warning(f"Rate limited, waiting {wait_time}s...")
                 time.sleep(wait_time)
                 attempt += 1
-                wait_time = wait_time * 2
+                wait_time *= 2
                 continue
             else:
                 logging.error(f"Webhook failed with status {response.status_code}: {response.text[:200]}")
@@ -395,16 +403,13 @@ def send_batch_webhook(batch, max_retries=3):
                 logging.info(f"✅ Batch webhook sent for {len(batch)} members.")
                 return
             elif response.status_code == 429:
-                try:
-                    data = response.json()
-                    retry_after = data.get('retry_after', wait_time)
-                except:
-                    retry_after = wait_time
+                data = response.json()
+                retry_after = data.get('retry_after', wait_time)
                 wait_time = max(wait_time, retry_after)
                 logging.warning(f"Batch rate limited, waiting {wait_time}s...")
                 time.sleep(wait_time)
                 attempt += 1
-                wait_time = wait_time * 2
+                wait_time *= 2
                 continue
             else:
                 logging.error(f"Batch webhook failed with status {response.status_code}: {response.text[:200]}")
@@ -414,13 +419,7 @@ def send_batch_webhook(batch, max_retries=3):
             attempt += 1
             time.sleep(2)
 
-# ---------- Processing ----------
 def process_new_members(new_members_dict):
-    """
-    new_members_dict: dict of member_id -> (tag, joined_at)
-    For each member, check join time; if within 2 days, send notification.
-    Then add to seen_members regardless, and save cache.
-    """
     if not new_members_dict:
         return
 
@@ -429,32 +428,23 @@ def process_new_members(new_members_dict):
     global seen_members
 
     for member_id, (tag, joined_at) in new_members_dict.items():
-        if not joined_at:
-            # No join time – still add to seen so we don't re‑process
-            seen_members.add(member_id)
-            continue
-        if not isinstance(joined_at, str):
+        if not joined_at or not isinstance(joined_at, str):
             seen_members.add(member_id)
             continue
         try:
             join_time = datetime.datetime.fromisoformat(joined_at.replace('Z', '+00:00'))
             age = (now - join_time).total_seconds()
             if age <= JOIN_WINDOW_SECONDS:
-                # Within 2 days – mark for notification
                 pending_notify.append({
                     'member_id': member_id,
                     'tag': tag,
                     'join_time': join_time
                 })
-            else:
-                logging.debug(f"Member {member_id} joined >2 days ago, skipping notification.")
         except Exception as e:
             logging.warning(f"Error parsing join time for {member_id}: {e}")
-        # Always add to seen, even if we couldn't parse or it's old
         seen_members.add(member_id)
 
     if pending_notify:
-        # Decide individual vs batch
         if len(pending_notify) <= INDIVIDUAL_THRESHOLD:
             logging.info(f"📨 Sending {len(pending_notify)} members individually.")
             for item in pending_notify:
@@ -471,7 +461,6 @@ def process_new_members(new_members_dict):
     save_seen_cache()
     logging.info(f"✅ Finished processing. Seen members now: {len(seen_members)}")
 
-# ---------- Startup webhook check ----------
 def wait_for_webhook_ready():
     logging.info("Checking webhook availability...")
     attempt = 0
@@ -484,16 +473,13 @@ def wait_for_webhook_ready():
                 logging.info("✅ Webhook is ready.")
                 return True
             elif response.status_code == 429:
-                try:
-                    data = response.json()
-                    retry_after = data.get('retry_after', wait_time)
-                except:
-                    retry_after = wait_time
+                data = response.json()
+                retry_after = data.get('retry_after', wait_time)
                 wait_time = max(wait_time, retry_after)
-                logging.warning(f"Webhook rate-limited on startup, waiting {wait_time}s...")
+                logging.warning(f"Webhook rate-limited, waiting {wait_time}s...")
                 time.sleep(wait_time)
                 attempt += 1
-                wait_time = wait_time * 2
+                wait_time *= 2
                 continue
             else:
                 logging.warning(f"Webhook check returned {response.status_code}. Proceeding anyway.")
@@ -504,8 +490,7 @@ def wait_for_webhook_ready():
 
 # ---------- Main ----------
 if __name__ == '__main__':
-    logging.info("Starting snitch (%ds interval, 2-day join window)...", scan_interval)
-
+    # 1. Start HTTP server FIRST
     try:
         from http.server import HTTPServer, BaseHTTPRequestHandler
         class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -517,42 +502,54 @@ if __name__ == '__main__':
                 self.send_response(200)
                 self.end_headers()
         def run_http_server():
-            server = HTTPServer(('0.0.0.0', int(os.environ.get('PORT', 10000))), HealthCheckHandler)
+            port = int(os.environ.get('PORT', 10000))
+            server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+            logging.info(f"HTTP health check server started on port {port}")
             server.serve_forever()
         threading.Thread(target=run_http_server, daemon=True).start()
-        logging.info("HTTP health check server started on port %s", os.environ.get('PORT', 10000))
     except Exception as e:
         logging.warning("Could not start HTTP server: %s", e)
 
+    # 2. Log config
     webhook_mask = webhook[:40] + "..." if len(webhook) > 40 else webhook
+    logging.info("Starting snitch (%ds interval, 2-day join window)...", scan_interval)
     logging.info("Configuration: guildId=%s, channelId=%s, token starts with %s..., webhook: %s",
                  guildId, channelId, token[:8], webhook_mask)
 
-    wait_for_webhook_ready()
+    # 3. Run everything else in a background thread
+    def main_loop():
+        # Check webhook (non‑blocking)
+        wait_for_webhook_ready()
 
-    logging.info("Building initial baseline and processing unseen members...")
-    current_members = autoSnitch(token, guildId, channelId)
-    logging.info("Scanned %s members.", len(current_members))
-
-    # Find all members not in the seen cache
-    new_members = {uid: data for uid, data in current_members.items() if uid not in seen_members}
-    if new_members:
-        logging.info("Found %s members not previously seen. Processing...", len(new_members))
-        process_new_members(new_members)
-    else:
-        logging.info("No new members found in baseline.")
-
-    # Main loop
-    while True:
+        # Initial baseline
+        logging.info("Building initial baseline and processing unseen members...")
         current_members = autoSnitch(token, guildId, channelId)
         logging.info("Scanned %s members.", len(current_members))
 
         new_members = {uid: data for uid, data in current_members.items() if uid not in seen_members}
         if new_members:
-            logging.info("Found %s new members.", len(new_members))
+            logging.info("Found %s members not previously seen. Processing...", len(new_members))
             process_new_members(new_members)
         else:
-            logging.info("No new members found.")
+            logging.info("No new members found in baseline.")
 
-        logging.info("Sleeping %s seconds...", scan_interval)
-        time.sleep(scan_interval)
+        # Main scan loop
+        while True:
+            current_members = autoSnitch(token, guildId, channelId)
+            logging.info("Scanned %s members.", len(current_members))
+
+            new_members = {uid: data for uid, data in current_members.items() if uid not in seen_members}
+            if new_members:
+                logging.info("Found %s new members.", len(new_members))
+                process_new_members(new_members)
+            else:
+                logging.info("No new members found.")
+
+            logging.info("Sleeping %s seconds...", scan_interval)
+            time.sleep(scan_interval)
+
+    threading.Thread(target=main_loop, daemon=False).start()
+
+    # 4. Keep main thread alive
+    while True:
+        time.sleep(1)
