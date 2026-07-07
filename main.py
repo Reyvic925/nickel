@@ -127,13 +127,10 @@ class DiscordSocket(websocket.WebSocketApp):
         self.members = {}
         self.ranges = [[0, 0]]
         self.online_count = 0
-        self.ranges_requested = 0
-        self.ranges_received = 0
+        self.lastRange = 0
         self.packets_recv = 0
-        self.last_scrape_time = time.time()
 
     def run(self):
-        # Let websocket-client use default ping settings to avoid the ping_interval > ping_timeout error
         self.run_forever()
         return self.members
 
@@ -150,8 +147,6 @@ class DiscordSocket(websocket.WebSocketApp):
                 "channels": {self.channel_id: self.ranges}
             }
         }
-        self.ranges_requested += len(self.ranges)
-        logging.info(f"Requesting {len(self.ranges)} range(s): {self.ranges}")
         self.send(json.dumps(payload))
 
     def sock_open(self, ws):
@@ -242,23 +237,29 @@ class DiscordSocket(websocket.WebSocketApp):
 
             if t == "READY":
                 for guild in decoded.get("d", {}).get("guilds", []):
-                    self.guilds[guild["id"]] = {
-                        "member_count": guild.get("member_count", 0),
-                        "online_count": guild.get("presence_count", 0)
-                    }
+                    self.guilds[guild["id"]] = {"member_count": guild.get("member_count", 0)}
 
             if t == "READY_SUPPLEMENTAL":
-                guild_data = self.guilds.get(self.guild_id, {})
-                self.online_count = guild_data.get("online_count", 0)
-                logging.info(f"Guild online count from READY_SUPPLEMENTAL: {self.online_count}")
-
-                if self.online_count > 0:
-                    # Request all ranges at once (in batches of 10 to avoid rate limits)
-                    self._request_all_ranges()
+                # Get online count from READY_SUPPLEMENTAL's d.guilds structure
+                supplemental_guilds = decoded.get("d", {}).get("guilds", {})
+                if isinstance(supplemental_guilds, dict):
+                    guild_data = supplemental_guilds.get(self.guild_id, {})
+                    self.online_count = guild_data.get("online_count", 0)
                 else:
-                    logging.warning("⚠️ Online count is 0 – cannot scrape.")
-                    self.endScraping = True
-                    self.close()
+                    self.online_count = 0
+                
+                logging.info(f"Guild online count from READY_SUPPLEMENTAL: {self.online_count}")
+                
+                if self.online_count > 0:
+                    self.ranges = [[0, 99]]
+                    self.lastRange = 0
+                    self.scrapeUsers()
+                else:
+                    # Fallback: try scraping anyway with a default range
+                    logging.warning("⚠️ Online count is 0 – attempting fallback scrape.")
+                    self.ranges = [[0, 99]]
+                    self.lastRange = 0
+                    self.scrapeUsers()
 
             elif t == "GUILD_MEMBER_LIST_UPDATE":
                 parsed = Utils.parseGuildMemberListUpdate(decoded)
@@ -269,8 +270,6 @@ class DiscordSocket(websocket.WebSocketApp):
                 if parsed.get('online_count'):
                     self.online_count = parsed['online_count']
 
-                # Track how many SYNC responses we've received
-                sync_count = 0
                 for elem, index in enumerate(parsed["types"]):
                     updates = parsed["updates"][elem]
                     if isinstance(updates, dict):
@@ -279,12 +278,9 @@ class DiscordSocket(websocket.WebSocketApp):
                         updates = []
 
                     if index == "SYNC":
-                        sync_count += 1
-                        self.ranges_received += 1
-                        
                         if len(updates) == 0:
-                            # Empty SYNC means no more members in this range
-                            continue
+                            self.endScraping = True
+                            break
                         
                         for item in updates:
                             self._process_member_item(item)
@@ -293,63 +289,17 @@ class DiscordSocket(websocket.WebSocketApp):
                         for item in updates:
                             self._process_member_item(item)
 
-                # Check if we've received all ranges we requested
-                if self.ranges_received >= self.ranges_requested and self.ranges_requested > 0:
-                    logging.info(
-                        f"✅ Finished scraping. Received {self.ranges_received} range(s). "
-                        f"Total online members captured: {len(self.members)}"
-                    )
-                    self.endScraping = True
-                    self.close()
-                else:
-                    # Check if we've captured enough members already
-                    if self.online_count > 0 and len(self.members) >= self.online_count:
-                        logging.info(
-                            f"✅ Captured all {len(self.members)} online members. Closing."
-                        )
-                        self.endScraping = True
-                        self.close()
+                    if not self.endScraping:
+                        self.lastRange += 1
+                        self.ranges = [[self.lastRange * 100, self.lastRange * 100 + 99]]
+                        self.scrapeUsers()
 
-            # Safety timeout - if no messages for 15 seconds after scraping started, close
-            if time.time() - self.last_scrape_time > 15 and self.ranges_requested > 0:
-                if not self.endScraping:
-                    logging.warning("⚠️ Timeout - no updates received. Closing connection.")
-                    self.endScraping = True
+                if self.endScraping:
+                    logging.info(f"✅ Finished scraping. Total online members captured: {len(self.members)}")
                     self.close()
 
         except Exception as e:
             logging.error(f"Error in sock_message: {e}")
-
-    def _request_all_ranges(self):
-        """Request all ranges for online members in batches."""
-        if self.online_count <= 0:
-            self.endScraping = True
-            self.close()
-            return
-
-        # Calculate all needed ranges (100 members per range)
-        all_ranges = []
-        for i in range(0, self.online_count, 100):
-            all_ranges.append([i, min(i + 99, self.online_count - 1)])
-
-        logging.info(
-            f"📊 Online members: {self.online_count}. "
-            f"Need {len(all_ranges)} range(s) to scrape."
-        )
-
-        # Send in batches of 10 ranges to avoid rate limits
-        BATCH_RANGES = 10
-        self.ranges_requested = 0
-        self.ranges_received = 0
-
-        for i in range(0, len(all_ranges), BATCH_RANGES):
-            batch = all_ranges[i:i + BATCH_RANGES]
-            self.ranges = batch
-            self.scrapeUsers()
-            if i + BATCH_RANGES < len(all_ranges):
-                time.sleep(0.5)  # Small delay between batches
-
-        self.last_scrape_time = time.time()
 
     def sock_close(self, ws, close_code, close_msg):
         pass
