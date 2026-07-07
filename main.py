@@ -84,7 +84,7 @@ class Utils:
                     memberdata['updates'].append(chunk['item'])
         return memberdata
 
-# ---------- WebSocket (with auto‑reconnect) ----------
+# ---------- WebSocket (with throttle) ----------
 class DiscordSocket(websocket.WebSocketApp):
     def __init__(self, token, guild_id, channel_id, on_ready=None):
         self.token = token
@@ -96,6 +96,8 @@ class DiscordSocket(websocket.WebSocketApp):
         self.reconnect_delay = 5
         self.reconnect_lock = threading.Lock()
         self._should_reconnect = True
+        self._scraping = False          # prevents overlapping requests
+        self._last_scrape_time = 0      # throttle
 
         self.socket_headers = {
             "Accept-Encoding": "gzip, deflate, br",
@@ -129,10 +131,17 @@ class DiscordSocket(websocket.WebSocketApp):
         self.run_forever(ping_interval=10, ping_timeout=5)
 
     def scrapeUsers(self):
-        if self.endScraping or not self.connected:
+        if self.endScraping or not self.connected or self._scraping:
             return
+        # Throttle: at least 0.5s between requests
+        now = time.time()
+        if now - self._last_scrape_time < 0.5:
+            return
+        self._last_scrape_time = now
+        self._scraping = True
+
         end = self.current_start + self.chunk_size - 1
-        self.ranges = [[self.current_start, end]]
+        self.ranges = [[int(self.current_start), int(end)]]
         payload = {
             "op": 14,
             "d": {
@@ -143,8 +152,13 @@ class DiscordSocket(websocket.WebSocketApp):
                 "channels": {self.channel_id: self.ranges}
             }
         }
-        logging.debug(f"Sending op 14: {payload}")
+        logging.debug(f"Sending op14: {json.dumps(payload)}")
         self.send(json.dumps(payload))
+        # Reset flag after a short delay to allow processing
+        threading.Timer(0.2, self._reset_scraping).start()
+
+    def _reset_scraping(self):
+        self._scraping = False
 
     def sock_open(self, ws):
         identify = {
@@ -218,10 +232,9 @@ class DiscordSocket(websocket.WebSocketApp):
                     self.total_member_count = member_count
                     self.current_start = 0
                     self.connected = True
-                    logging.info("WebSocket ready, starting scrape.")
-                    if self.on_ready_callback:
-                        self.on_ready_callback()
-                    self.scrapeUsers()
+                    logging.info("WebSocket ready, starting scrape (after 0.5s delay).")
+                    # Wait 500ms before first scrape to let gateway stabilise
+                    threading.Timer(0.5, self._start_scrape).start()
                 else:
                     logging.warning("⚠️ Member count is 0 – cannot scrape.")
 
@@ -267,21 +280,24 @@ class DiscordSocket(websocket.WebSocketApp):
                         self.endScraping = True
                         self.close()
                     else:
-                        self.scrapeUsers()
+                        # Wait a bit before requesting next chunk
+                        threading.Timer(0.5, self.scrapeUsers).start()
 
         except Exception as e:
             logging.error(f"Error in sock_message: {e}")
+
+    def _start_scrape(self):
+        if self.connected and not self.endScraping:
+            self.scrapeUsers()
 
     def sock_close(self, ws, close_code, close_msg):
         logging.warning(f"WebSocket closed: code={close_code}, msg={close_msg}")
         self.connected = False
         if not self.endScraping and self._should_reconnect:
-            # Cancel any pending reconnect timer
             if self._reconnect_timer:
                 self._reconnect_timer.cancel()
-            # Schedule reconnect with exponential backoff
             delay = self.reconnect_delay
-            self.reconnect_delay = min(self.reconnect_delay * 2, 60)  # max 60s
+            self.reconnect_delay = min(self.reconnect_delay * 2, 60)
             logging.info(f"Reconnecting in {delay} seconds...")
             self._reconnect_timer = threading.Timer(delay, self._reconnect)
             self._reconnect_timer.daemon = True
@@ -297,49 +313,12 @@ class DiscordSocket(websocket.WebSocketApp):
         logging.error(f"WebSocket error: {err}")
 
 # ---------- Helpers ----------
-def get_voice_channel_id(guild_id, token):
-    """Fetch a voice channel ID from the guild using REST API."""
-    sess = tls_client.Session(client_identifier='chrome_105')
-    sess.headers.update({
-        'Authorization': token,
-        'Content-Type': 'application/json',
-    })
-    resp = sess.get(f'https://discord.com/api/v9/guilds/{guild_id}/channels')
-    if resp.status_code != 200:
-        logging.error(f"Failed to fetch channels: {resp.status_code}")
-        return None
-    channels = resp.json()
-    for ch in channels:
-        if ch.get('type') == 2:  # 2 = voice channel
-            return str(ch['id'])
-    return None
-
 def autoSnitch(token, guild_id, channel_id):
-    # Verify channel is a voice channel, if not try to find one
-    actual_channel = channel_id
-    # Quick REST check to see if channel is voice
-    sess = tls_client.Session(client_identifier='chrome_105')
-    sess.headers.update({'Authorization': token})
-    ch_resp = sess.get(f'https://discord.com/api/v9/channels/{channel_id}')
-    if ch_resp.status_code == 200:
-        ch_data = ch_resp.json()
-        if ch_data.get('type') != 2:  # not voice
-            logging.warning(f"Channel {channel_id} is not a voice channel (type={ch_data.get('type')}). Trying to find a voice channel...")
-            voice_ch = get_voice_channel_id(guild_id, token)
-            if voice_ch:
-                actual_channel = voice_ch
-                logging.info(f"Using voice channel {actual_channel} instead.")
-            else:
-                logging.error("No voice channel found. Please set DISCORD_CHANNEL_ID to a voice channel.")
-                return {}
-    else:
-        logging.warning(f"Could not fetch channel info, using provided ID anyway.")
-
     ready_event = threading.Event()
     def on_ready():
         ready_event.set()
 
-    sb = DiscordSocket(token, guild_id, actual_channel, on_ready=on_ready)
+    sb = DiscordSocket(token, guild_id, channel_id, on_ready=on_ready)
     thread = threading.Thread(target=sb.run, daemon=True)
     thread.start()
     # Wait for ready
@@ -546,7 +525,6 @@ def wait_for_webhook_ready():
 
 # ---------- Main ----------
 if __name__ == '__main__':
-    # 1. Start HTTP server FIRST
     try:
         from http.server import HTTPServer, BaseHTTPRequestHandler
         class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -566,13 +544,11 @@ if __name__ == '__main__':
     except Exception as e:
         logging.warning("Could not start HTTP server: %s", e)
 
-    # 2. Log config
     webhook_mask = webhook[:40] + "..." if len(webhook) > 40 else webhook
     logging.info("Starting snitch (%ds interval, 2-day join window)...", scan_interval)
     logging.info("Configuration: guildId=%s, channelId=%s, token starts with %s..., webhook: %s",
                  guildId, channelId, token[:8], webhook_mask)
 
-    # 3. Run everything else in a background thread
     def main_loop():
         wait_for_webhook_ready()
 
@@ -603,6 +579,5 @@ if __name__ == '__main__':
 
     threading.Thread(target=main_loop, daemon=False).start()
 
-    # 4. Keep main thread alive
     while True:
         time.sleep(1)
