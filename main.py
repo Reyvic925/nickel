@@ -73,29 +73,29 @@ class Utils:
 
     def parseGuildMemberListUpdate(response):
         memberdata = {
-            "online_count": response["d"]["online_count"],
-            "member_count": response["d"]["member_count"],
-            "id": response["d"]["id"],
-            "guild_id": response["d"]["guild_id"],
-            "hoisted_roles": response["d"]["groups"],
+            "online_count": response["d"].get("online_count", 0),
+            "member_count": response["d"].get("member_count", 0),
+            "id": response["d"].get("id"),
+            "guild_id": response["d"].get("guild_id"),
+            "hoisted_roles": response["d"].get("groups", []),
             "types": [],
             "locations": [],
             "updates": []
         }
-        for chunk in response['d']['ops']:
+        for chunk in response['d'].get('ops', []):
             memberdata['types'].append(chunk['op'])
             if chunk['op'] in ('SYNC', 'INVALIDATE'):
-                memberdata['locations'].append(chunk['range'])
+                memberdata['locations'].append(chunk.get('range'))
                 if chunk['op'] == 'SYNC':
-                    memberdata['updates'].append(chunk['items'])
+                    memberdata['updates'].append(chunk.get('items', []))
                 else:
                     memberdata['updates'].append([])
             elif chunk['op'] in ('INSERT', 'UPDATE', 'DELETE'):
-                memberdata['locations'].append(chunk['index'])
+                memberdata['locations'].append(chunk.get('index'))
                 if chunk['op'] == 'DELETE':
                     memberdata['updates'].append([])
                 else:
-                    memberdata['updates'].append(chunk['item'])
+                    memberdata['updates'].append(chunk.get('item'))
         return memberdata
 
 # ---------- WebSocket ----------
@@ -126,11 +126,15 @@ class DiscordSocket(websocket.WebSocketApp):
         self.guilds = {}
         self.members = {}
         self.ranges = [[0, 0]]
-        self.lastRange = 0
+        self.online_count = 0
+        self.ranges_requested = 0
+        self.ranges_received = 0
         self.packets_recv = 0
+        self.last_scrape_time = time.time()
 
     def run(self):
-        self.run_forever()
+        # Add timeout so we don't hang forever
+        self.run_forever(ping_timeout=30, ping_interval=10)
         return self.members
 
     def scrapeUsers(self):
@@ -146,6 +150,8 @@ class DiscordSocket(websocket.WebSocketApp):
                 "channels": {self.channel_id: self.ranges}
             }
         }
+        self.ranges_requested += len(self.ranges)
+        logging.info(f"Requesting {len(self.ranges)} range(s): {self.ranges}")
         self.send(json.dumps(payload))
 
     def sock_open(self, ws):
@@ -191,6 +197,30 @@ class DiscordSocket(websocket.WebSocketApp):
         except Exception:
             return
 
+    def _process_member_item(self, item):
+        """Extract and store a member if valid. Returns True if member was added."""
+        if not isinstance(item, dict) or "member" not in item:
+            return False
+        mem = item["member"]
+        user = mem.get("user", {})
+        if not user:
+            return False
+        user_id = user.get("id")
+        if not user_id:
+            return False
+        if user.get("bot"):
+            return False
+        if user_id in self.blacklisted_users:
+            return False
+        if set(self.blacklisted_roles).intersection(mem.get("roles", [])):
+            return False
+        username = user.get('username', 'Unknown')
+        discrim = user.get('discriminator', '0')
+        tag = f"{username}#{discrim}" if discrim != "0" else f"@{username}"
+        joined_at = mem.get('joined_at')
+        self.members[user_id] = (tag, joined_at)
+        return True
+
     def sock_message(self, ws, message):
         try:
             decoded = json.loads(message)
@@ -204,26 +234,43 @@ class DiscordSocket(websocket.WebSocketApp):
                 self.packets_recv += 1
 
             if op == 10:
-                threading.Thread(target=self.heartbeatThread, args=(decoded["d"]["heartbeat_interval"] / 1000,), daemon=True).start()
+                threading.Thread(
+                    target=self.heartbeatThread,
+                    args=(decoded["d"]["heartbeat_interval"] / 1000,),
+                    daemon=True
+                ).start()
 
             if t == "READY":
                 for guild in decoded.get("d", {}).get("guilds", []):
-                    self.guilds[guild["id"]] = {"member_count": guild.get("member_count", 0)}
+                    self.guilds[guild["id"]] = {
+                        "member_count": guild.get("member_count", 0),
+                        "online_count": guild.get("presence_count", 0)
+                    }
 
             if t == "READY_SUPPLEMENTAL":
-                member_count = self.guilds.get(self.guild_id, {}).get("member_count", 0)
-                if member_count:
-                    self.ranges = [[0, 99]]
-                    self.lastRange = 0
-                    self.scrapeUsers()
+                guild_data = self.guilds.get(self.guild_id, {})
+                self.online_count = guild_data.get("online_count", 0)
+                logging.info(f"Guild online count from READY_SUPPLEMENTAL: {self.online_count}")
+
+                if self.online_count > 0:
+                    # Request all ranges at once (in batches of 10 to avoid rate limits)
+                    self._request_all_ranges()
                 else:
-                    logging.warning("⚠️ Member count is 0 – cannot scrape.")
+                    logging.warning("⚠️ Online count is 0 – cannot scrape.")
+                    self.endScraping = True
+                    self.close()
 
             elif t == "GUILD_MEMBER_LIST_UPDATE":
                 parsed = Utils.parseGuildMemberListUpdate(decoded)
-                if parsed['guild_id'] != self.guild_id:
+                if parsed.get('guild_id') != self.guild_id:
                     return
 
+                # Update online count if provided in the update
+                if parsed.get('online_count'):
+                    self.online_count = parsed['online_count']
+
+                # Track how many SYNC responses we've received
+                sync_count = 0
                 for elem, index in enumerate(parsed["types"]):
                     updates = parsed["updates"][elem]
                     if isinstance(updates, dict):
@@ -232,62 +279,77 @@ class DiscordSocket(websocket.WebSocketApp):
                         updates = []
 
                     if index == "SYNC":
+                        sync_count += 1
+                        self.ranges_received += 1
+                        
                         if len(updates) == 0:
-                            self.endScraping = True
-                            break
+                            # Empty SYNC means no more members in this range
+                            continue
+                        
                         for item in updates:
-                            if "member" in item:
-                                mem = item["member"]
-                                user = mem.get("user", {})
-                                if not user:
-                                    continue
-                                user_id = user.get("id")
-                                if not user_id:
-                                    continue
-                                if set(self.blacklisted_roles).intersection(mem.get("roles", [])):
-                                    continue
-                                if user.get("bot"):
-                                    continue
-                                if user_id in self.blacklisted_users:
-                                    continue
-                                username = user.get('username', 'Unknown')
-                                discrim = user.get('discriminator', '0')
-                                tag = f"{username}#{discrim}" if discrim != "0" else f"@{username}"
-                                joined_at = mem.get('joined_at')
-                                self.members[user_id] = (tag, joined_at)
+                            self._process_member_item(item)
 
-                    elif index == "UPDATE":
+                    elif index in ("UPDATE", "INSERT"):
                         for item in updates:
-                            if "member" in item:
-                                mem = item["member"]
-                                user = mem.get("user", {})
-                                if not user:
-                                    continue
-                                user_id = user.get("id")
-                                if not user_id:
-                                    continue
-                                if set(self.blacklisted_roles).intersection(mem.get("roles", [])):
-                                    continue
-                                if user.get("bot"):
-                                    continue
-                                if user_id in self.blacklisted_users:
-                                    continue
-                                username = user.get('username', 'Unknown')
-                                discrim = user.get('discriminator', '0')
-                                tag = f"{username}#{discrim}" if discrim != "0" else f"@{username}"
-                                joined_at = mem.get('joined_at')
-                                self.members[user_id] = (tag, joined_at)
+                            self._process_member_item(item)
 
-                    if not self.endScraping:
-                        self.lastRange += 1
-                        self.ranges = [[self.lastRange*100, self.lastRange*100+99]]
-                        self.scrapeUsers()
+                # Check if we've received all ranges we requested
+                if self.ranges_received >= self.ranges_requested and self.ranges_requested > 0:
+                    logging.info(
+                        f"✅ Finished scraping. Received {self.ranges_received} range(s). "
+                        f"Total online members captured: {len(self.members)}"
+                    )
+                    self.endScraping = True
+                    self.close()
+                else:
+                    # Check if we've captured enough members already
+                    if self.online_count > 0 and len(self.members) >= self.online_count:
+                        logging.info(
+                            f"✅ Captured all {len(self.members)} online members. Closing."
+                        )
+                        self.endScraping = True
+                        self.close()
 
-                if self.endScraping:
+            # Safety timeout - if no messages for 15 seconds after scraping started, close
+            if time.time() - self.last_scrape_time > 15 and self.ranges_requested > 0:
+                if not self.endScraping:
+                    logging.warning("⚠️ Timeout - no updates received. Closing connection.")
+                    self.endScraping = True
                     self.close()
 
         except Exception as e:
             logging.error(f"Error in sock_message: {e}")
+
+    def _request_all_ranges(self):
+        """Request all ranges for online members in batches."""
+        if self.online_count <= 0:
+            self.endScraping = True
+            self.close()
+            return
+
+        # Calculate all needed ranges (100 members per range)
+        all_ranges = []
+        for i in range(0, self.online_count, 100):
+            all_ranges.append([i, min(i + 99, self.online_count - 1)])
+
+        logging.info(
+            f"📊 Online members: {self.online_count}. "
+            f"Need {len(all_ranges)} range(s) to scrape."
+        )
+
+        # Send in batches of 10 ranges to avoid rate limits
+        BATCH_RANGES = 10
+        self.ranges_requested = 0
+        self.ranges_received = 0
+
+        for i in range(0, len(all_ranges), BATCH_RANGES):
+            batch = all_ranges[i:i + BATCH_RANGES]
+            self.ranges = batch
+            self.scrapeUsers()
+            if i + BATCH_RANGES < len(all_ranges):
+                time.sleep(0.5)  # Small delay between batches
+
+        self.last_scrape_time = time.time()
 
     def sock_close(self, ws, close_code, close_msg):
         pass
@@ -507,7 +569,6 @@ def wait_for_webhook_ready():
                 wait_time = wait_time * 2
                 continue
             else:
-                # Non-429 error – maybe invalid webhook, but we continue anyway.
                 logging.warning(f"Webhook check returned {response.status_code}. Proceeding anyway.")
                 return True
         except Exception as e:
@@ -528,6 +589,8 @@ if __name__ == '__main__':
             def do_HEAD(self):
                 self.send_response(200)
                 self.end_headers()
+            def log_message(self, format, *args):
+                return  # Suppress HTTP server logs
         def run_http_server():
             server = HTTPServer(('0.0.0.0', int(os.environ.get('PORT', 10000))), HealthCheckHandler)
             server.serve_forever()
@@ -552,6 +615,7 @@ if __name__ == '__main__':
     process_new_members(current_members_raw)
 
     while True:
+        logging.info("🔄 Starting new scan cycle...")
         new_members_raw = autoSnitch(token, guildId, channelId)
         new_ids = set(new_members_raw.keys())
         logging.info("Scanned: %s members visible.", len(new_ids))
@@ -561,6 +625,8 @@ if __name__ == '__main__':
             diff_dict = {uid: new_members_raw[uid] for uid in diff_ids}
             logging.info("Found %s new IDs not in previous scan.", len(diff_dict))
             process_new_members(diff_dict)
+        else:
+            logging.info("No new members detected in this scan.")
 
         current_ids = new_ids
         logging.info("Sleeping %s seconds...", scan_interval)
