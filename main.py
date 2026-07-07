@@ -84,7 +84,7 @@ class Utils:
                     memberdata['updates'].append(chunk['item'])
         return memberdata
 
-# ---------- WebSocket (with throttle) ----------
+# ---------- WebSocket (fixed Identify) ----------
 class DiscordSocket(websocket.WebSocketApp):
     def __init__(self, token, guild_id, channel_id, on_ready=None):
         self.token = token
@@ -96,8 +96,8 @@ class DiscordSocket(websocket.WebSocketApp):
         self.reconnect_delay = 5
         self.reconnect_lock = threading.Lock()
         self._should_reconnect = True
-        self._scraping = False          # prevents overlapping requests
-        self._last_scrape_time = 0      # throttle
+        self._scraping = False
+        self._last_scrape_time = 0
 
         self.socket_headers = {
             "Accept-Encoding": "gzip, deflate, br",
@@ -105,7 +105,7 @@ class DiscordSocket(websocket.WebSocketApp):
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
             "Sec-WebSocket-Extensions": "permessage-deflate; client_max_window_bits",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:94.0) Gecko/20100101 Firefox/94.0",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         }
         super().__init__(
             "wss://gateway.discord.gg/?encoding=json&v=9",
@@ -133,7 +133,6 @@ class DiscordSocket(websocket.WebSocketApp):
     def scrapeUsers(self):
         if self.endScraping or not self.connected or self._scraping:
             return
-        # Throttle: at least 0.5s between requests
         now = time.time()
         if now - self._last_scrape_time < 0.5:
             return
@@ -152,37 +151,41 @@ class DiscordSocket(websocket.WebSocketApp):
                 "channels": {self.channel_id: self.ranges}
             }
         }
-        logging.debug(f"Sending op14: {json.dumps(payload)}")
+        logging.info(f"Sending op14: {json.dumps(payload)}")
         self.send(json.dumps(payload))
-        # Reset flag after a short delay to allow processing
         threading.Timer(0.2, self._reset_scraping).start()
 
     def _reset_scraping(self):
         self._scraping = False
 
     def sock_open(self, ws):
+        # Minimal, modern Identify payload
         identify = {
             "op": 2,
             "d": {
                 "token": self.token,
-                "capabilities": 125,
                 "properties": {
                     "os": "Windows",
-                    "browser": "Firefox",
+                    "browser": "Chrome",
                     "device": "",
-                    "system_locale": "it-IT",
-                    "browser_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:94.0) Gecko/20100101 Firefox/94.0",
-                    "browser_version": "94.0",
+                    "system_locale": "en-US",
+                    "browser_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "browser_version": "120.0.0.0",
                     "os_version": "10",
                     "referrer": "",
                     "referring_domain": "",
                     "referrer_current": "",
                     "referring_domain_current": "",
                     "release_channel": "stable",
-                    "client_build_number": 103981,
+                    "client_build_number": 99999,   # still needed for some clients, but we set a modern one
                     "client_event_source": None
                 },
-                "presence": {"status": "online", "since": 0, "activities": [], "afk": False},
+                "presence": {
+                    "status": "online",
+                    "since": 0,
+                    "activities": [],
+                    "afk": False
+                },
                 "compress": False,
                 "client_state": {
                     "guild_hashes": {},
@@ -190,9 +193,11 @@ class DiscordSocket(websocket.WebSocketApp):
                     "read_state_version": 0,
                     "user_guild_settings_version": -1,
                     "user_settings_version": -1
-                }
+                },
+                "intents": 1 << 1   # GUILD_MEMBERS intent (required to receive member lists)
             }
         }
+        logging.info(f"Sending Identify: {json.dumps(identify)}")
         self.send(json.dumps(identify))
 
     def heartbeatThread(self, interval):
@@ -205,6 +210,8 @@ class DiscordSocket(websocket.WebSocketApp):
 
     def sock_message(self, ws, message):
         try:
+            # Log every incoming message for debugging
+            logging.info(f"Received: {message[:200]}")  # truncate for readability
             decoded = json.loads(message)
             if not isinstance(decoded, dict):
                 return
@@ -232,9 +239,10 @@ class DiscordSocket(websocket.WebSocketApp):
                     self.total_member_count = member_count
                     self.current_start = 0
                     self.connected = True
-                    logging.info("WebSocket ready, starting scrape (after 0.5s delay).")
-                    # Wait 500ms before first scrape to let gateway stabilise
-                    threading.Timer(0.5, self._start_scrape).start()
+                    logging.info("WebSocket ready, waiting 3s before first scrape...")
+                    threading.Timer(3.0, self._start_scrape).start()
+                    if self.on_ready_callback:
+                        self.on_ready_callback()
                 else:
                     logging.warning("⚠️ Member count is 0 – cannot scrape.")
 
@@ -280,15 +288,17 @@ class DiscordSocket(websocket.WebSocketApp):
                         self.endScraping = True
                         self.close()
                     else:
-                        # Wait a bit before requesting next chunk
                         threading.Timer(0.5, self.scrapeUsers).start()
 
         except Exception as e:
             logging.error(f"Error in sock_message: {e}")
 
     def _start_scrape(self):
-        if self.connected and not self.endScraping:
+        if self.connected and not self.endScraping and self.total_member_count > 0:
+            logging.info("Initiating member list scrape...")
             self.scrapeUsers()
+        else:
+            logging.warning("Cannot start scrape – connection or member count invalid.")
 
     def sock_close(self, ws, close_code, close_msg):
         logging.warning(f"WebSocket closed: code={close_code}, msg={close_msg}")
@@ -321,14 +331,12 @@ def autoSnitch(token, guild_id, channel_id):
     sb = DiscordSocket(token, guild_id, channel_id, on_ready=on_ready)
     thread = threading.Thread(target=sb.run, daemon=True)
     thread.start()
-    # Wait for ready
     ready_event.wait(timeout=30)
     if not ready_event.is_set():
         logging.warning("Initial ready timeout, closing socket.")
         sb._should_reconnect = False
         sb.close()
         return {}
-    # Wait for scraping to complete
     while not sb.endScraping:
         time.sleep(1)
     sb._should_reconnect = False
@@ -348,7 +356,7 @@ def session(token):
         'sec-fetch-mode': 'cors',
         'sec-fetch-site': 'same-origin',
         'sec-gpc': '1',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36',
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'x-context-properties': 'eyJsb2NhdGlvbiI6IlVzZXIgUHJvZmlsZSJ9',
         'x-debug-options': 'bugReporterEnabled',
         'x-discord-locale': 'en-US',
