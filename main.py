@@ -1,7 +1,7 @@
 import logging, os, datetime, time, json, threading, requests, httpx, tls_client, pickle
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ---------- Read configuration with robust parsing ----------
+# ---------- Read configuration ----------
 def safe_json_parse(value, fallback=None):
     if not value:
         return fallback
@@ -32,7 +32,7 @@ if 'DISCORD_TOKEN' in os.environ:
     tokens = safe_json_parse(os.environ.get('DISCORD_TOKENS'), [])
     if not tokens and token:
         tokens = [token]
-    baseline_timeout = int(os.environ.get('BASELINE_TIMEOUT', '120'))
+    baseline_timeout = int(os.environ.get('BASELINE_TIMEOUT', '180'))
 else:
     from json import load
     config = load(open('config.json'))
@@ -44,7 +44,7 @@ else:
     blacklistedRoles = config.get('blacklistedRoles', [])
     blacklistedUsers = config.get('blacklistedUsers', [])
     scan_interval = 60
-    baseline_timeout = 120
+    baseline_timeout = 180
 
 if not isinstance(channel_ids, list):
     channel_ids = [channel_ids] if channel_ids else []
@@ -54,9 +54,9 @@ channel_ids = [c for c in channel_ids if c]
 tokens = [t for t in tokens if t]
 
 if not channel_ids:
-    raise ValueError("No channel IDs provided. Set DISCORD_CHANNEL_IDS or DISCORD_CHANNEL_ID.")
+    raise ValueError("No channel IDs provided.")
 if not tokens:
-    raise ValueError("No tokens provided. Set DISCORD_TOKENS or DISCORD_TOKEN.")
+    raise ValueError("No tokens provided.")
 
 try:
     import websocket
@@ -72,7 +72,6 @@ logging.basicConfig(
 
 JOIN_WINDOW_SECONDS = 2 * 24 * 60 * 60
 NOTIFIED_CACHE_FILE = "notified_members.pkl"
-
 if os.path.exists(NOTIFIED_CACHE_FILE):
     with open(NOTIFIED_CACHE_FILE, 'rb') as f:
         notified_members = pickle.load(f)
@@ -83,7 +82,6 @@ def save_notified_cache():
     with open(NOTIFIED_CACHE_FILE, 'wb') as f:
         pickle.dump(notified_members, f)
 
-# ---------- Utils ----------
 class Utils:
     def rangeCorrector(ranges):
         if [0, 99] not in ranges:
@@ -124,7 +122,6 @@ class Utils:
                     memberdata['updates'].append(chunk['item'])
         return memberdata
 
-# ---------- DiscordSocket with timeout thread ----------
 class DiscordSocket(websocket.WebSocketApp):
     def __init__(self, token, guild_id, channel_ids, timeout_seconds=baseline_timeout):
         self.token = token
@@ -133,7 +130,6 @@ class DiscordSocket(websocket.WebSocketApp):
         self.blacklisted_roles = [str(r) for r in blacklistedRoles]
         self.blacklisted_users = [str(u) for u in blacklistedUsers]
         self.timeout_seconds = timeout_seconds
-
         self.socket_headers = {
             "Accept-Encoding": "gzip, deflate, br",
             "Accept-Language": "en-US,en;q=0.9",
@@ -158,15 +154,13 @@ class DiscordSocket(websocket.WebSocketApp):
         self.total_member_count = 0
         self.channels_completed = 0
         self.start_time = time.time()
-        self.received_events = []
         self.timeout_triggered = False
+        self.event_count = 0
 
-        # Start a background thread to force timeout
         self.timeout_thread = threading.Thread(target=self._timeout_monitor, daemon=True)
         self.timeout_thread.start()
 
     def _timeout_monitor(self):
-        """Force close the socket after timeout_seconds regardless of events."""
         time.sleep(self.timeout_seconds)
         if not self.endScraping:
             logging.warning(f"⏱️ Baseline timeout ({self.timeout_seconds}s) reached – forcing completion.")
@@ -216,16 +210,17 @@ class DiscordSocket(websocket.WebSocketApp):
         if self.endScraping:
             return
         try:
+            self.event_count += 1
+            # Log raw message for first 3 events to debug structure
+            if self.event_count <= 3:
+                logging.info(f"RAW EVENT #{self.event_count}: {message[:500]}")
+
             decoded = json.loads(message)
             if not isinstance(decoded, dict):
                 return
 
             op = decoded.get("op")
             t = decoded.get("t")
-
-            if t:
-                logging.debug(f"Received event: {t}")
-                self.received_events.append(t)
 
             if op != 11:
                 self.packets_recv += 1
@@ -253,7 +248,6 @@ class DiscordSocket(websocket.WebSocketApp):
                 logging.info("GUILD_MEMBER_LIST_UPDATE received")
                 parsed = Utils.parseGuildMemberListUpdate(decoded)
                 if parsed['guild_id'] != self.guild_id:
-                    logging.debug("Guild mismatch, ignoring")
                     return
 
                 channel_id = parsed.get('id')
@@ -261,99 +255,74 @@ class DiscordSocket(websocket.WebSocketApp):
                     logging.debug(f"Update for channel {channel_id} not in our list, ignoring")
                     return
 
-                # Log the types we see
-                logging.debug(f"Types in update: {parsed['types']}")
+                # Process each type
+                for idx, typ in enumerate(parsed["types"]):
+                    updates = parsed["updates"][idx]
+                    if isinstance(updates, dict):
+                        updates = [updates]
+                    elif not isinstance(updates, list):
+                        updates = []
 
-                if 'SYNC' in parsed['types'] or 'UPDATE' in parsed['types']:
-                    for elem, index in enumerate(parsed["types"]):
-                        updates = parsed["updates"][elem]
-                        # Convert to list if needed
-                        if isinstance(updates, dict):
-                            updates = [updates]
-                        elif not isinstance(updates, list):
-                            updates = []
+                    if typ == "SYNC":
+                        if len(updates) == 0:
+                            self.channels_completed += 1
+                            logging.info(f"Channel {channel_id} completed ({self.channels_completed}/{len(self.channel_ids)})")
+                            if self.channels_completed >= len(self.channel_ids):
+                                self.endScraping = True
+                                self.close()
+                            break
+                        for item in updates:
+                            self._add_member(item)
+                    elif typ == "UPDATE":
+                        for item in updates:
+                            self._add_member(item)
 
-                        logging.debug(f"Processing {len(updates)} items for {index}")
+                if not self.endScraping:
+                    self.lastRange += 1
+                    self.ranges = Utils.getRanges(self.lastRange, 100, self.total_member_count)
+                    self.scrapeUsers()
 
-                        if index == "SYNC":
-                            if len(updates) == 0:
-                                self.channels_completed += 1
-                                logging.info(f"Channel {channel_id} completed ({self.channels_completed}/{len(self.channel_ids)})")
-                                if self.channels_completed >= len(self.channel_ids):
-                                    self.endScraping = True
-                                    self.close()
-                                break
-                            for item in updates:
-                                # Try to extract member
-                                mem = item.get('member')
-                                if not mem:
-                                    # Some updates might have a different structure
-                                    logging.warning("No 'member' key in item, skipping")
-                                    continue
-                                user = mem.get('user', {})
-                                if not user:
-                                    continue
-                                user_id = user.get('id')
-                                if not user_id:
-                                    continue
-                                if set(self.blacklisted_roles).intersection(mem.get('roles', [])):
-                                    continue
-                                if user.get('bot'):
-                                    continue
-                                if user_id in self.blacklisted_users:
-                                    continue
-                                username = user.get('username', 'Unknown')
-                                discrim = user.get('discriminator', '0')
-                                if discrim != "0":
-                                    tag = f"{username}#{discrim}"
-                                else:
-                                    tag = f"@{username}"
-                                joined_at = mem.get('joined_at')
-                                if user_id not in self.members:
-                                    self.members[user_id] = (tag, joined_at)
-                                    logging.debug(f"Added member {user_id} ({tag})")
-
-                        elif index == "UPDATE":
-                            for item in updates:
-                                mem = item.get('member')
-                                if not mem:
-                                    logging.warning("No 'member' key in UPDATE item, skipping")
-                                    continue
-                                user = mem.get('user', {})
-                                if not user:
-                                    continue
-                                user_id = user.get('id')
-                                if not user_id:
-                                    continue
-                                if set(self.blacklisted_roles).intersection(mem.get('roles', [])):
-                                    continue
-                                if user.get('bot'):
-                                    continue
-                                if user_id in self.blacklisted_users:
-                                    continue
-                                username = user.get('username', 'Unknown')
-                                discrim = user.get('discriminator', '0')
-                                if discrim != "0":
-                                    tag = f"{username}#{discrim}"
-                                else:
-                                    tag = f"@{username}"
-                                joined_at = mem.get('joined_at')
-                                if user_id not in self.members:
-                                    self.members[user_id] = (tag, joined_at)
-                                    logging.debug(f"Added member {user_id} ({tag})")
-
-                    if not self.endScraping:
-                        self.lastRange += 1
-                        self.ranges = Utils.getRanges(self.lastRange, 100, self.total_member_count)
-                        self.scrapeUsers()
-
-            # If timeout was triggered by background thread, close immediately
             if self.timeout_triggered:
                 self.endScraping = True
                 self.close()
 
         except Exception as e:
             logging.error(f"Error in sock_message: {e}")
+
+    def _add_member(self, item):
+        """Extract member from item and add to self.members if valid."""
+        # Try to get member data
+        mem = item.get('member')
+        if not mem:
+            # Maybe item is the member object itself (has 'user')
+            if 'user' in item:
+                mem = item
+            else:
+                logging.warning(f"Could not find member data in item: {item}")
+                return
+        user = mem.get('user', {})
+        if not user:
+            logging.warning("No 'user' field in member")
+            return
+        user_id = user.get('id')
+        if not user_id:
+            return
+        if set(self.blacklisted_roles).intersection(mem.get('roles', [])):
+            return
+        if user.get('bot'):
+            return
+        if user_id in self.blacklisted_users:
+            return
+        username = user.get('username', 'Unknown')
+        discrim = user.get('discriminator', '0')
+        if discrim != "0":
+            tag = f"{username}#{discrim}"
+        else:
+            tag = f"@{username}"
+        joined_at = mem.get('joined_at')
+        if user_id not in self.members:
+            self.members[user_id] = (tag, joined_at)
+            logging.debug(f"Added member {user_id} ({tag})")
 
     def sock_close(self, ws, close_code, close_msg):
         logging.info(f"WebSocket closed: {close_code} - {close_msg}")
@@ -449,14 +418,12 @@ def process_new_members(new_members_dict):
             logging.warning("Error processing %s: %s", member_id, e)
     logging.info("Finished processing %s new members.", total)
 
-# ---------- Main ----------
 if __name__ == '__main__':
     logging.info("Starting improved snitch (%ds interval, %d channel(s), %d token(s))",
                  scan_interval, len(channel_ids), len(tokens))
     logging.info("Channels: %s", channel_ids)
     logging.info("Tokens: %s", [t[:8]+"..." for t in tokens])
 
-    # HTTP keep‑alive
     try:
         from http.server import HTTPServer, BaseHTTPRequestHandler
         class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -477,8 +444,6 @@ if __name__ == '__main__':
 
     logging.info("Building initial baseline (timeout %ds)...", baseline_timeout)
     combined_members = {}
-
-    # Try with all channels
     for i, t in enumerate(tokens):
         try:
             logging.info("Token %s scanning baseline...", t[:8])
@@ -491,7 +456,6 @@ if __name__ == '__main__':
             logging.error("Token %s baseline failed: %s", t[:8], e)
         time.sleep(1)
 
-    # If no members were collected, fall back to first channel only
     if len(combined_members) == 0:
         logging.warning("⚠️ Baseline with all channels returned 0 members. Retrying with first channel only...")
         fallback_channel = channel_ids[0]
