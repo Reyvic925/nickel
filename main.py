@@ -59,16 +59,12 @@ def save_notified_cache():
 
 class Utils:
     def rangeCorrector(ranges):
-        if [0, 99] not in ranges:
-            ranges.insert(0, [0, 99])
         return ranges
 
     def getRanges(index, multiplier, memberCount):
-        initialNum = int(index*multiplier)
-        rangesList = [[initialNum, initialNum+99]]
-        if memberCount > initialNum+99:
-            rangesList.append([initialNum+100, initialNum+199])
-        return Utils.rangeCorrector(rangesList)
+        start = index * multiplier
+        end = start + 99
+        return [[start, end]]
 
     def parseGuildMemberListUpdate(response):
         memberdata = {
@@ -212,68 +208,74 @@ class DiscordSocket(websocket.WebSocketApp):
             if t == "READY_SUPPLEMENTAL":
                 member_count = self.guilds.get(self.guild_id, {}).get("member_count", 0)
                 if member_count:
-                    self.ranges = Utils.getRanges(0, 100, member_count)
+                    self.ranges = [[0, 99]]
+                    self.lastRange = 0
                     self.scrapeUsers()
+                else:
+                    logging.warning("⚠️ Member count is 0 – cannot scrape.")
 
             elif t == "GUILD_MEMBER_LIST_UPDATE":
                 parsed = Utils.parseGuildMemberListUpdate(decoded)
-                if parsed['guild_id'] == self.guild_id and ('SYNC' in parsed['types'] or 'UPDATE' in parsed['types']):
-                    for elem, index in enumerate(parsed["types"]):
-                        updates = parsed["updates"][elem]
-                        if isinstance(updates, dict):
-                            updates = [updates]
-                        elif not isinstance(updates, list):
-                            updates = []
+                if parsed['guild_id'] != self.guild_id:
+                    return
 
-                        if index == "SYNC":
-                            if len(updates) == 0:
-                                self.endScraping = True
-                                break
-                            for item in updates:
-                                if "member" in item:
-                                    mem = item["member"]
-                                    user = mem.get("user", {})
-                                    if not user:
-                                        continue
-                                    user_id = user.get("id")
-                                    if not user_id:
-                                        continue
-                                    if set(self.blacklisted_roles).intersection(mem.get("roles", [])):
-                                        continue
-                                    if user.get("bot"):
-                                        continue
-                                    if user_id in self.blacklisted_users:
-                                        continue
-                                    username = user.get('username', 'Unknown')
-                                    discrim = user.get('discriminator', '0')
-                                    tag = f"{username}#{discrim}" if discrim != "0" else f"@{username}"
-                                    joined_at = mem.get('joined_at')
-                                    self.members[user_id] = (tag, joined_at)
+                for elem, index in enumerate(parsed["types"]):
+                    updates = parsed["updates"][elem]
+                    if isinstance(updates, dict):
+                        updates = [updates]
+                    elif not isinstance(updates, list):
+                        updates = []
 
-                        elif index == "UPDATE":
-                            for item in updates:
-                                if "member" in item:
-                                    mem = item["member"]
-                                    user = mem.get("user", {})
-                                    if not user:
-                                        continue
-                                    user_id = user.get("id")
-                                    if not user_id:
-                                        continue
-                                    if set(self.blacklisted_roles).intersection(mem.get("roles", [])):
-                                        continue
-                                    if user.get("bot"):
-                                        continue
-                                    if user_id in self.blacklisted_users:
-                                        continue
-                                    username = user.get('username', 'Unknown')
-                                    discrim = user.get('discriminator', '0')
-                                    tag = f"{username}#{discrim}" if discrim != "0" else f"@{username}"
-                                    joined_at = mem.get('joined_at')
-                                    self.members[user_id] = (tag, joined_at)
+                    if index == "SYNC":
+                        if len(updates) == 0:
+                            self.endScraping = True
+                            break
+                        for item in updates:
+                            if "member" in item:
+                                mem = item["member"]
+                                user = mem.get("user", {})
+                                if not user:
+                                    continue
+                                user_id = user.get("id")
+                                if not user_id:
+                                    continue
+                                if set(self.blacklisted_roles).intersection(mem.get("roles", [])):
+                                    continue
+                                if user.get("bot"):
+                                    continue
+                                if user_id in self.blacklisted_users:
+                                    continue
+                                username = user.get('username', 'Unknown')
+                                discrim = user.get('discriminator', '0')
+                                tag = f"{username}#{discrim}" if discrim != "0" else f"@{username}"
+                                joined_at = mem.get('joined_at')
+                                self.members[user_id] = (tag, joined_at)
 
+                    elif index == "UPDATE":
+                        for item in updates:
+                            if "member" in item:
+                                mem = item["member"]
+                                user = mem.get("user", {})
+                                if not user:
+                                    continue
+                                user_id = user.get("id")
+                                if not user_id:
+                                    continue
+                                if set(self.blacklisted_roles).intersection(mem.get("roles", [])):
+                                    continue
+                                if user.get("bot"):
+                                    continue
+                                if user_id in self.blacklisted_users:
+                                    continue
+                                username = user.get('username', 'Unknown')
+                                discrim = user.get('discriminator', '0')
+                                tag = f"{username}#{discrim}" if discrim != "0" else f"@{username}"
+                                joined_at = mem.get('joined_at')
+                                self.members[user_id] = (tag, joined_at)
+
+                    if not self.endScraping:
                         self.lastRange += 1
-                        self.ranges = Utils.getRanges(self.lastRange, 100, self.guilds.get(self.guild_id, {}).get("member_count", 0))
+                        self.ranges = [[self.lastRange*100, self.lastRange*100+99]]
                         self.scrapeUsers()
 
                 if self.endScraping:
@@ -316,9 +318,9 @@ def session(token):
     })
     return sess
 
-def send_webhook_with_retry(member_id, join_time, tag, max_retries=3):
-    """Send webhook with exponential backoff on 429."""
+def send_webhook_with_retry(member_id, join_time, tag, max_retries=5):
     attempt = 0
+    wait_time = 2  # initial wait
     while attempt <= max_retries:
         try:
             sess = session(token)
@@ -351,12 +353,18 @@ def send_webhook_with_retry(member_id, join_time, tag, max_retries=3):
                 logging.info(f"✅ Webhook sent successfully for {member_id}")
                 return
             elif response.status_code == 429:
-                # Rate limited – wait and retry
-                retry_after = response.json().get('retry_after', 1)
-                wait_time = max(1, retry_after)
+                try:
+                    data = response.json()
+                    retry_after = data.get('retry_after', wait_time)
+                except:
+                    retry_after = wait_time
+                # ensure we wait at least the retry_after
+                wait_time = max(wait_time, retry_after)
                 logging.warning(f"Webhook rate limited for {member_id}, waiting {wait_time}s...")
                 time.sleep(wait_time)
                 attempt += 1
+                # double the wait for next try (exponential backoff)
+                wait_time = wait_time * 2
                 continue
             else:
                 logging.error(f"Webhook failed with status {response.status_code}: {response.text[:200]}")
@@ -377,24 +385,21 @@ def process_new_members(new_members_dict):
     now = datetime.datetime.now(datetime.timezone.utc)
     for member_id, (tag, joined_at) in new_members_dict.items():
         if not joined_at:
-            logging.debug("Member %s has no joined_at, skipping", member_id)
             continue
         try:
             if not isinstance(joined_at, str):
-                logging.debug("Member %s joined_at is not a string, skipping", member_id)
                 continue
             join_time = datetime.datetime.fromisoformat(joined_at.replace('Z', '+00:00'))
             age = (now - join_time).total_seconds()
             if age <= JOIN_WINDOW_SECONDS:
                 if member_id in notified_members:
-                    logging.debug("Member %s already notified, skipping.", member_id)
                     continue
                 logging.info("✅ New member (within 2 days): %s (%s)", member_id, tag)
                 send_webhook_with_retry(member_id, join_time, tag)
                 notified_members.add(member_id)
                 save_notified_cache()
-                # Delay between webhook requests to avoid rate limits
-                time.sleep(0.5)
+                # Wait 3 seconds between different members
+                time.sleep(3)
             else:
                 logging.debug("Member %s joined %.1f days ago – skipped", member_id, age/86400)
         except Exception as e:
