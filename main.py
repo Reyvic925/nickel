@@ -32,7 +32,7 @@ if 'DISCORD_TOKEN' in os.environ:
     tokens = safe_json_parse(os.environ.get('DISCORD_TOKENS'), [])
     if not tokens and token:
         tokens = [token]
-    baseline_timeout = int(os.environ.get('BASELINE_TIMEOUT', '30'))  # seconds
+    baseline_timeout = int(os.environ.get('BASELINE_TIMEOUT', '120'))
 else:
     from json import load
     config = load(open('config.json'))
@@ -44,7 +44,7 @@ else:
     blacklistedRoles = config.get('blacklistedRoles', [])
     blacklistedUsers = config.get('blacklistedUsers', [])
     scan_interval = 60
-    baseline_timeout = 30
+    baseline_timeout = 120
 
 if not isinstance(channel_ids, list):
     channel_ids = [channel_ids] if channel_ids else []
@@ -124,7 +124,7 @@ class Utils:
                     memberdata['updates'].append(chunk['item'])
         return memberdata
 
-# ---------- DiscordSocket ----------
+# ---------- DiscordSocket with timeout thread ----------
 class DiscordSocket(websocket.WebSocketApp):
     def __init__(self, token, guild_id, channel_ids, timeout_seconds=baseline_timeout):
         self.token = token
@@ -159,6 +159,24 @@ class DiscordSocket(websocket.WebSocketApp):
         self.channels_completed = 0
         self.start_time = time.time()
         self.received_events = []
+        self.timeout_triggered = False
+
+        # Start a background thread to force timeout
+        self.timeout_thread = threading.Thread(target=self._timeout_monitor, daemon=True)
+        self.timeout_thread.start()
+
+    def _timeout_monitor(self):
+        """Force close the socket after timeout_seconds regardless of events."""
+        time.sleep(self.timeout_seconds)
+        if not self.endScraping:
+            logging.warning(f"⏱️ Baseline timeout ({self.timeout_seconds}s) reached – forcing completion.")
+            self.timeout_triggered = True
+            self.endScraping = True
+            # Force close the WebSocket connection
+            if hasattr(self, 'ws') and self.ws:
+                self.ws.close()
+            else:
+                self.close()
 
     def run(self):
         self.run_forever()
@@ -167,7 +185,6 @@ class DiscordSocket(websocket.WebSocketApp):
     def scrapeUsers(self):
         if self.endScraping:
             return
-        # Only send if ranges are valid (not empty)
         if not self.ranges or not self.ranges[0]:
             logging.warning("Ranges empty, not scraping.")
             return
@@ -185,6 +202,7 @@ class DiscordSocket(websocket.WebSocketApp):
         self.send(json.dumps(payload))
 
     def sock_open(self, ws):
+        self.ws = ws
         self.send('{"op":2,"d":{"token":"' + self.token + '","capabilities":125,"properties":{"os":"Windows","browser":"Firefox","device":"","system_locale":"it-IT","browser_user_agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:94.0) Gecko/20100101 Firefox/94.0","browser_version":"94.0","os_version":"10","referrer":"","referring_domain":"","referrer_current":"","referring_domain_current":"","release_channel":"stable","client_build_number":103981,"client_event_source":null},"presence":{"status":"online","since":0,"activities":[],"afk":false},"compress":false,"client_state":{"guild_hashes":{},"highest_last_message_id":"0","read_state_version":0,"user_guild_settings_version":-1,"user_settings_version":-1}}}')
 
     def heartbeatThread(self, interval):
@@ -196,6 +214,8 @@ class DiscordSocket(websocket.WebSocketApp):
             return
 
     def sock_message(self, ws, message):
+        if self.endScraping:
+            return
         try:
             decoded = json.loads(message)
             if not isinstance(decoded, dict):
@@ -204,7 +224,6 @@ class DiscordSocket(websocket.WebSocketApp):
             op = decoded.get("op")
             t = decoded.get("t")
 
-            # Log every event type for debugging
             if t:
                 logging.debug(f"Received event: {t}")
                 self.received_events.append(t)
@@ -228,7 +247,7 @@ class DiscordSocket(websocket.WebSocketApp):
                     self.scrapeUsers()
                 else:
                     logging.warning("No member count, using default ranges.")
-                    self.ranges = Utils.getRanges(0, 100, 1000)  # fallback
+                    self.ranges = Utils.getRanges(0, 100, 1000)
                     self.scrapeUsers()
 
             elif t == "GUILD_MEMBER_LIST_UPDATE":
@@ -252,7 +271,6 @@ class DiscordSocket(websocket.WebSocketApp):
 
                         if index == "SYNC":
                             if len(updates) == 0:
-                                # one channel finished
                                 self.channels_completed += 1
                                 logging.info(f"Channel {channel_id} completed ({self.channels_completed}/{len(self.channel_ids)})")
                                 if self.channels_completed >= len(self.channel_ids):
@@ -315,13 +333,9 @@ class DiscordSocket(websocket.WebSocketApp):
                         self.ranges = Utils.getRanges(self.lastRange, 100, self.total_member_count)
                         self.scrapeUsers()
 
-                # Timeout check: if we've been waiting too long, force completion
-                if time.time() - self.start_time > self.timeout_seconds:
-                    logging.warning(f"Timeout ({self.timeout_seconds}s) reached, forcing completion with {len(self.members)} members.")
-                    self.endScraping = True
-                    self.close()
-
-            if self.endScraping:
+            # If timeout was triggered by background thread, close immediately
+            if self.timeout_triggered:
+                self.endScraping = True
                 self.close()
 
         except Exception as e:
@@ -329,18 +343,18 @@ class DiscordSocket(websocket.WebSocketApp):
 
     def sock_close(self, ws, close_code, close_msg):
         logging.info(f"WebSocket closed: {close_code} - {close_msg}")
-
+        # If we closed due to timeout, don't wait for more events
+        if self.timeout_triggered or self.endScraping:
+            return
 
 def autoSnitch(token, guild_id, channel_ids):
     sb = DiscordSocket(token, guild_id, channel_ids)
     return sb.run()
 
-
 def rotateProxy():
     if proxy:
         return {'http': 'http://%s' % proxy, 'https': 'http://%s' % proxy}
     return None
-
 
 def session(token):
     sess = tls_client.Session(client_identifier='chrome_105')
@@ -362,7 +376,6 @@ def session(token):
         'x-super-properties': 'eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiRGlzY29yZCBDbGllbnQiLCJyZWxlYXNlX2NoYW5uZWwiOiJjYW5hcnkiLCJjbGllbnRfdmVyc2lvbiI6IjEuMC41OSIsIm9zX3ZlcnNpb24iOiIxMC4wLjIyNjIxIiwib3NfYXJjaCI6Ing2NCIsInN5c3RlbV9sb2NhbGUiOiJlbi1VUyIsImNsaWVudF9idWlsZF9udW1iZXIiOjE4MTk2NywibmF0aXZlX2J1aWxkX251bWJlciI6MzA4NTIsImNsaWVudF9ldmVudF9zb3VyY2UiOm51bGwsImRlc2lnbl9pZCI6MH0='
     })
     return sess
-
 
 def send_webhook(member_id, join_time, tag):
     try:
@@ -396,7 +409,6 @@ def send_webhook(member_id, join_time, tag):
     except Exception as e:
         logging.error("Webhook failed for %s: %s", member_id, e)
 
-
 def process_new_members(new_members_dict):
     if not new_members_dict:
         return
@@ -424,7 +436,6 @@ def process_new_members(new_members_dict):
             logging.warning("Error processing %s: %s", member_id, e)
     logging.info("Finished processing %s new members.", total)
 
-
 if __name__ == '__main__':
     logging.info("Starting improved snitch (%ds interval, %d channel(s), %d token(s))",
                  scan_interval, len(channel_ids), len(tokens))
@@ -450,7 +461,6 @@ if __name__ == '__main__':
     except Exception as e:
         logging.warning("Could not start HTTP server: %s", e)
 
-    # Baseline with timeout
     logging.info("Building initial baseline (timeout %ds)...", baseline_timeout)
     combined_members = {}
     for i, t in enumerate(tokens):
@@ -471,7 +481,6 @@ if __name__ == '__main__':
     logging.info("Checking baseline members for recent joins...")
     process_new_members(combined_members)
 
-    # Main loop
     while True:
         all_new_members = {}
         for i, t in enumerate(tokens):
