@@ -1,4 +1,4 @@
-import logging, os, datetime, time, json, threading, requests, httpx, tls_client, pickle
+import logging, os, datetime, time, json, threading, requests, tls_client, pickle
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ---------- Read configuration ----------
@@ -49,17 +49,18 @@ logging.basicConfig(
 )
 
 JOIN_WINDOW_SECONDS = 2 * 24 * 60 * 60
-NOTIFIED_CACHE_FILE = "notified_members.pkl"
+SEEN_CACHE_FILE = "seen_members.pkl"
 
-if os.path.exists(NOTIFIED_CACHE_FILE):
-    with open(NOTIFIED_CACHE_FILE, 'rb') as f:
-        notified_members = pickle.load(f)
+# Load seen members cache (all IDs we have ever encountered)
+if os.path.exists(SEEN_CACHE_FILE):
+    with open(SEEN_CACHE_FILE, 'rb') as f:
+        seen_members = pickle.load(f)
 else:
-    notified_members = set()
+    seen_members = set()
 
-def save_notified_cache():
-    with open(NOTIFIED_CACHE_FILE, 'wb') as f:
-        pickle.dump(notified_members, f)
+def save_seen_cache():
+    with open(SEEN_CACHE_FILE, 'wb') as f:
+        pickle.dump(seen_members, f)
 
 # ---------- Utils ----------
 class Utils:
@@ -68,7 +69,7 @@ class Utils:
 
     def getRanges(index, multiplier, memberCount):
         start = index * multiplier
-        end = start + 99
+        end = start + multiplier - 1
         return [[start, end]]
 
     def parseGuildMemberListUpdate(response):
@@ -125,8 +126,9 @@ class DiscordSocket(websocket.WebSocketApp):
         self.endScraping = False
         self.guilds = {}
         self.members = {}
-        self.ranges = [[0, 0]]
-        self.lastRange = 0
+        self.chunk_size = 1000
+        self.current_start = 0
+        self.total_member_count = 0
         self.packets_recv = 0
 
     def run(self):
@@ -136,6 +138,8 @@ class DiscordSocket(websocket.WebSocketApp):
     def scrapeUsers(self):
         if self.endScraping:
             return
+        end = self.current_start + self.chunk_size - 1
+        self.ranges = [[self.current_start, end]]
         payload = {
             "op": 14,
             "d": {
@@ -213,8 +217,8 @@ class DiscordSocket(websocket.WebSocketApp):
             if t == "READY_SUPPLEMENTAL":
                 member_count = self.guilds.get(self.guild_id, {}).get("member_count", 0)
                 if member_count:
-                    self.ranges = [[0, 99]]
-                    self.lastRange = 0
+                    self.total_member_count = member_count
+                    self.current_start = 0
                     self.scrapeUsers()
                 else:
                     logging.warning("⚠️ Member count is 0 – cannot scrape.")
@@ -224,17 +228,16 @@ class DiscordSocket(websocket.WebSocketApp):
                 if parsed['guild_id'] != self.guild_id:
                     return
 
-                for elem, index in enumerate(parsed["types"]):
+                self.total_member_count = parsed.get('member_count', self.total_member_count)
+
+                for elem, op_type in enumerate(parsed["types"]):
                     updates = parsed["updates"][elem]
                     if isinstance(updates, dict):
                         updates = [updates]
                     elif not isinstance(updates, list):
                         updates = []
 
-                    if index == "SYNC":
-                        if len(updates) == 0:
-                            self.endScraping = True
-                            break
+                    if op_type in ("SYNC", "UPDATE"):
                         for item in updates:
                             if "member" in item:
                                 mem = item["member"]
@@ -256,35 +259,13 @@ class DiscordSocket(websocket.WebSocketApp):
                                 joined_at = mem.get('joined_at')
                                 self.members[user_id] = (tag, joined_at)
 
-                    elif index == "UPDATE":
-                        for item in updates:
-                            if "member" in item:
-                                mem = item["member"]
-                                user = mem.get("user", {})
-                                if not user:
-                                    continue
-                                user_id = user.get("id")
-                                if not user_id:
-                                    continue
-                                if set(self.blacklisted_roles).intersection(mem.get("roles", [])):
-                                    continue
-                                if user.get("bot"):
-                                    continue
-                                if user_id in self.blacklisted_users:
-                                    continue
-                                username = user.get('username', 'Unknown')
-                                discrim = user.get('discriminator', '0')
-                                tag = f"{username}#{discrim}" if discrim != "0" else f"@{username}"
-                                joined_at = mem.get('joined_at')
-                                self.members[user_id] = (tag, joined_at)
-
-                    if not self.endScraping:
-                        self.lastRange += 1
-                        self.ranges = [[self.lastRange*100, self.lastRange*100+99]]
+                if not self.endScraping:
+                    self.current_start += self.chunk_size
+                    if self.total_member_count > 0 and self.current_start >= self.total_member_count:
+                        self.endScraping = True
+                        self.close()
+                    else:
                         self.scrapeUsers()
-
-                if self.endScraping:
-                    self.close()
 
         except Exception as e:
             logging.error(f"Error in sock_message: {e}")
@@ -340,7 +321,7 @@ def send_single_webhook(member_id, tag, join_time, max_retries=3):
                 clean_username = tag
             join_str = join_time.strftime("%m-%d-%Y on %I:%M %p")
             payload = {
-                "content": f"@here New User Joined {guildId}",
+                "content": f"<@{member_id}> just joined!",
                 "embeds": [{
                     "color": 161791,
                     "author": {"name": "Snitched Successful"},
@@ -349,7 +330,6 @@ def send_single_webhook(member_id, tag, join_time, max_retries=3):
                         {"name": "Username", "value": clean_username, "inline": True},
                         {"name": "User ID", "value": member_id, "inline": True},
                         {"name": "Joined Server", "value": join_str, "inline": False},
-                        {"name": "Mention", "value": f"<@{member_id}>", "inline": True},
                         {"name": "Guild", "value": guild_name, "inline": True}
                     ]
                 }]
@@ -434,53 +414,62 @@ def send_batch_webhook(batch, max_retries=3):
             attempt += 1
             time.sleep(2)
 
-# ---------- Processing with smart individual/batch ----------
+# ---------- Processing ----------
 def process_new_members(new_members_dict):
+    """
+    new_members_dict: dict of member_id -> (tag, joined_at)
+    For each member, check join time; if within 2 days, send notification.
+    Then add to seen_members regardless, and save cache.
+    """
     if not new_members_dict:
         return
 
     now = datetime.datetime.now(datetime.timezone.utc)
-    pending = []
+    pending_notify = []
+    global seen_members
 
     for member_id, (tag, joined_at) in new_members_dict.items():
         if not joined_at:
+            # No join time – still add to seen so we don't re‑process
+            seen_members.add(member_id)
             continue
         if not isinstance(joined_at, str):
+            seen_members.add(member_id)
             continue
         try:
             join_time = datetime.datetime.fromisoformat(joined_at.replace('Z', '+00:00'))
             age = (now - join_time).total_seconds()
             if age <= JOIN_WINDOW_SECONDS:
-                if member_id in notified_members:
-                    continue
-                pending.append({
+                # Within 2 days – mark for notification
+                pending_notify.append({
                     'member_id': member_id,
                     'tag': tag,
                     'join_time': join_time
                 })
-                notified_members.add(member_id)
+            else:
+                logging.debug(f"Member {member_id} joined >2 days ago, skipping notification.")
         except Exception as e:
-            logging.warning(f"Error processing {member_id}: {e}")
+            logging.warning(f"Error parsing join time for {member_id}: {e}")
+        # Always add to seen, even if we couldn't parse or it's old
+        seen_members.add(member_id)
 
-    if not pending:
-        return
-
-    # Decide: individual or batch?
-    if len(pending) <= INDIVIDUAL_THRESHOLD:
-        logging.info(f"📨 Sending {len(pending)} members individually.")
-        for item in pending:
-            send_single_webhook(item['member_id'], item['tag'], item['join_time'])
-            time.sleep(2)
-    else:
-        logging.info(f"📦 Sending {len(pending)} members in batches of {BATCH_SIZE}.")
-        for i in range(0, len(pending), BATCH_SIZE):
-            batch = pending[i:i+BATCH_SIZE]
-            send_batch_webhook(batch)
-            if i + BATCH_SIZE < len(pending):
+    if pending_notify:
+        # Decide individual vs batch
+        if len(pending_notify) <= INDIVIDUAL_THRESHOLD:
+            logging.info(f"📨 Sending {len(pending_notify)} members individually.")
+            for item in pending_notify:
+                send_single_webhook(item['member_id'], item['tag'], item['join_time'])
                 time.sleep(2)
+        else:
+            logging.info(f"📦 Sending {len(pending_notify)} members in batches of {BATCH_SIZE}.")
+            for i in range(0, len(pending_notify), BATCH_SIZE):
+                batch = pending_notify[i:i+BATCH_SIZE]
+                send_batch_webhook(batch)
+                if i + BATCH_SIZE < len(pending_notify):
+                    time.sleep(2)
 
-    save_notified_cache()
-    logging.info("✅ Finished processing new members.")
+    save_seen_cache()
+    logging.info(f"✅ Finished processing. Seen members now: {len(seen_members)}")
 
 # ---------- Startup webhook check ----------
 def wait_for_webhook_ready():
@@ -507,7 +496,6 @@ def wait_for_webhook_ready():
                 wait_time = wait_time * 2
                 continue
             else:
-                # Non-429 error – maybe invalid webhook, but we continue anyway.
                 logging.warning(f"Webhook check returned {response.status_code}. Proceeding anyway.")
                 return True
         except Exception as e:
@@ -540,28 +528,31 @@ if __name__ == '__main__':
     logging.info("Configuration: guildId=%s, channelId=%s, token starts with %s..., webhook: %s",
                  guildId, channelId, token[:8], webhook_mask)
 
-    # Wait for webhook to be ready (not rate-limited)
     wait_for_webhook_ready()
 
-    logging.info("Building initial baseline...")
-    current_members_raw = autoSnitch(token, guildId, channelId)
-    current_ids = set(current_members_raw.keys())
-    logging.info("Baseline built: %s members visible.", len(current_ids))
+    logging.info("Building initial baseline and processing unseen members...")
+    current_members = autoSnitch(token, guildId, channelId)
+    logging.info("Scanned %s members.", len(current_members))
 
-    logging.info("Checking baseline members for recent joins...")
-    process_new_members(current_members_raw)
+    # Find all members not in the seen cache
+    new_members = {uid: data for uid, data in current_members.items() if uid not in seen_members}
+    if new_members:
+        logging.info("Found %s members not previously seen. Processing...", len(new_members))
+        process_new_members(new_members)
+    else:
+        logging.info("No new members found in baseline.")
 
+    # Main loop
     while True:
-        new_members_raw = autoSnitch(token, guildId, channelId)
-        new_ids = set(new_members_raw.keys())
-        logging.info("Scanned: %s members visible.", len(new_ids))
+        current_members = autoSnitch(token, guildId, channelId)
+        logging.info("Scanned %s members.", len(current_members))
 
-        diff_ids = new_ids - current_ids
-        if diff_ids:
-            diff_dict = {uid: new_members_raw[uid] for uid in diff_ids}
-            logging.info("Found %s new IDs not in previous scan.", len(diff_dict))
-            process_new_members(diff_dict)
+        new_members = {uid: data for uid, data in current_members.items() if uid not in seen_members}
+        if new_members:
+            logging.info("Found %s new members.", len(new_members))
+            process_new_members(new_members)
+        else:
+            logging.info("No new members found.")
 
-        current_ids = new_ids
         logging.info("Sleeping %s seconds...", scan_interval)
         time.sleep(scan_interval)
