@@ -133,8 +133,8 @@ class DiscordSocket(websocket.WebSocketApp):
         self.last_scrape_time = time.time()
 
     def run(self):
-        # Add timeout so we don't hang forever
-        self.run_forever(ping_timeout=30, ping_interval=10)
+        # Let websocket-client use default ping settings to avoid the ping_interval > ping_timeout error
+        self.run_forever()
         return self.members
 
     def scrapeUsers(self):
