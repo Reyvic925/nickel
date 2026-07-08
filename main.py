@@ -4,15 +4,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ---------- Read configuration ----------
 if 'DISCORD_TOKEN' in os.environ:
     token = os.environ.get('DISCORD_TOKEN')
-    guildId = os.environ.get('DISCORD_GUILD_ID')
-    # ---------- MULTI‑CHANNEL SUPPORT ----------
-    # Accept comma‑separated list of channel IDs
+    raw_guild = os.environ.get('DISCORD_GUILD_ID', '')
+    if ',' in raw_guild:
+        guildId = raw_guild.split(',')[0].strip()
+        logging.warning(f"Multiple guild IDs detected, using the first one: {guildId}")
+    else:
+        guildId = raw_guild
     channel_id_env = os.environ.get('DISCORD_CHANNEL_ID', '')
     if ',' in channel_id_env:
         channelIds = [ch.strip() for ch in channel_id_env.split(',') if ch.strip()]
     else:
         channelIds = [channel_id_env] if channel_id_env else []
-    # ------------------------------------------
     webhook = os.environ.get('DISCORD_WEBHOOK')
     proxy = os.environ.get('DISCORD_PROXY', '')
     blacklistedRoles = json.loads(os.environ.get('DISCORD_BLACKLISTED_ROLES', '[]'))
@@ -24,7 +26,9 @@ else:
     from json import load
     config = load(open('config.json'))
     guildId = config.get('guildID')
-    # Support both old single 'channelId' and new list 'channelIds'
+    if isinstance(guildId, list):
+        guildId = guildId[0]
+        logging.warning(f"Multiple guild IDs in config, using first: {guildId}")
     if 'channelIds' in config:
         channelIds = config['channelIds']
     elif 'channelId' in config:
@@ -225,12 +229,13 @@ class DiscordSocket(websocket.WebSocketApp):
 
             if t == "READY_SUPPLEMENTAL":
                 member_count = self.guilds.get(self.guild_id, {}).get("member_count", 0)
-                if member_count:
-                    self.ranges = [[0, 99]]
-                    self.lastRange = 0
-                    self.scrapeUsers()
-                else:
-                    logging.warning("⚠️ Member count is 0 – cannot scrape.")
+                if member_count == 0:
+                    logging.warning(f"⚠️ Member count is 0 for channel {self.channel_id}. Closing socket.")
+                    self.close()
+                    return
+                self.ranges = [[0, 99]]
+                self.lastRange = 0
+                self.scrapeUsers()
 
             elif t == "GUILD_MEMBER_LIST_UPDATE":
                 parsed = Utils.parseGuildMemberListUpdate(decoded)
@@ -306,24 +311,48 @@ class DiscordSocket(websocket.WebSocketApp):
         pass
 
 # ---------- Helpers ----------
-# <<< CHANGED: now accepts a list of channel IDs >>>
-def autoSnitch(token, guild_id, channel_ids):
+# <<< NEW: Fetch member info from API when joined_at is missing >>>
+def fetch_member_joined_at(user_id):
+    """Fetch the joined_at timestamp for a specific user from Discord API."""
+    try:
+        sess = session(token)
+        resp = sess.get(f'https://discord.com/api/v9/guilds/{guildId}/members/{user_id}')
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get('joined_at')
+        else:
+            logging.warning(f"API fetch for {user_id} returned {resp.status_code}")
+            return None
+    except Exception as e:
+        logging.error(f"Error fetching member {user_id}: {e}")
+        return None
+
+def autoSnitch(token, guild_id, channel_ids, max_retries=3):
     """
     Scrape members from one or more channels.
-    Returns a dict of {user_id: (tag, joined_at)} merged across all channels.
+    Retries each channel up to max_retries if it returns 0 members or fails.
+    Returns a merged dict.
     """
     all_members = {}
     for ch_id in channel_ids:
-        try:
-            logging.info(f"Scanning channel {ch_id} ...")
-            sb = DiscordSocket(token, guild_id, ch_id)
-            result = sb.run()
-            all_members.update(result)
-            logging.info(f"Channel {ch_id} returned {len(result)} members.")
-        except Exception as e:
-            logging.error(f"Error scanning channel {ch_id}: {e}")
+        for attempt in range(max_retries):
+            try:
+                logging.info(f"Scanning channel {ch_id} (attempt {attempt+1}/{max_retries}) ...")
+                sb = DiscordSocket(token, guild_id, ch_id)
+                result = sb.run()
+                if result:
+                    logging.info(f"Channel {ch_id} returned {len(result)} members.")
+                    all_members.update(result)
+                    break   # success, move to next channel
+                else:
+                    logging.warning(f"Channel {ch_id} returned 0 members. Retrying...")
+                    time.sleep(2 * (attempt + 1))
+            except Exception as e:
+                logging.error(f"Error scanning channel {ch_id}: {e}")
+                time.sleep(2 * (attempt + 1))
+        else:
+            logging.error(f"Failed to get members from channel {ch_id} after {max_retries} attempts.")
     return all_members
-# ------------------------------------------------
 
 def rotateProxy():
     if proxy:
@@ -462,7 +491,7 @@ def send_batch_webhook(batch, max_retries=3):
             attempt += 1
             time.sleep(2)
 
-# ---------- Processing with smart individual/batch ----------
+# ---------- Processing with fallback API call ----------
 def process_new_members(new_members_dict):
     if not new_members_dict:
         return
@@ -471,8 +500,14 @@ def process_new_members(new_members_dict):
     pending = []
 
     for member_id, (tag, joined_at) in new_members_dict.items():
+        # If joined_at is None or empty, try to fetch from API
         if not joined_at:
-            continue
+            logging.info(f"Missing joined_at for {member_id}, fetching via API...")
+            joined_at = fetch_member_joined_at(member_id)
+            if not joined_at:
+                logging.warning(f"Could not fetch joined_at for {member_id}, skipping.")
+                continue
+
         if not isinstance(joined_at, str):
             continue
         try:
@@ -487,13 +522,15 @@ def process_new_members(new_members_dict):
                     'join_time': join_time
                 })
                 notified_members.add(member_id)
+            else:
+                logging.debug(f"Member {member_id} joined {age/3600:.1f} hours ago, skipping.")
         except Exception as e:
             logging.warning(f"Error processing {member_id}: {e}")
 
     if not pending:
+        logging.info("No new members within 2‑day window.")
         return
 
-    # Decide: individual or batch?
     if len(pending) <= INDIVIDUAL_THRESHOLD:
         logging.info(f"📨 Sending {len(pending)} members individually.")
         for item in pending:
@@ -567,7 +604,6 @@ if __name__ == '__main__':
     logging.info("Configuration: guildId=%s, channels=%s, token starts with %s..., webhook: %s",
                  guildId, channelIds, token[:8], webhook_mask)
 
-    # Wait for webhook to be ready (not rate-limited)
     wait_for_webhook_ready()
 
     logging.info("Building initial baseline (scanning all channels)...")
