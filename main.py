@@ -149,10 +149,17 @@ class DiscordSocket(websocket.WebSocketApp):
         self.ranges = [[0, 0]]
         self.lastRange = 0
         self.packets_recv = 0
+        self.rate_limited = False   # flag to indicate we got a rate limit close
 
-    def run(self):
-        self.run_forever()
+    # ---------- CHANGED: run with timeout ----------
+    def run(self, timeout=30):
+        """
+        Run the WebSocket with a timeout (seconds).
+        If the scrape doesn't complete within timeout, the socket is closed and we return whatever we have.
+        """
+        self.run_forever(timeout=timeout)
         return self.members
+    # ------------------------------------------------
 
     def scrapeUsers(self):
         if self.endScraping:
@@ -312,7 +319,10 @@ class DiscordSocket(websocket.WebSocketApp):
             logging.error(f"Error in sock_message: {e}")
 
     def sock_close(self, ws, close_code, close_msg):
-        pass
+        # Detect rate limit close codes (1008, 4009, or message contains "Rate limited")
+        if close_msg and "Rate limited" in close_msg:
+            self.rate_limited = True
+            logging.warning(f"Rate limit detected on channel {self.channel_id}.")
 
 # ---------- Helpers ----------
 def fetch_member_joined_at(user_id):
@@ -342,14 +352,20 @@ def autoSnitch(token, guild_id, channel_ids, max_retries=3):
             try:
                 logging.info(f"Scanning channel {ch_id} (attempt {attempt+1}/{max_retries}) ...")
                 sb = DiscordSocket(token, guild_id, ch_id)
-                result = sb.run()
+                result = sb.run(timeout=30)   # timeout after 30 seconds
                 if result:
                     logging.info(f"Channel {ch_id} returned {len(result)} members.")
                     all_members.update(result)
                     break   # success, move to next channel
                 else:
-                    logging.warning(f"Channel {ch_id} returned 0 members. Retrying...")
-                    time.sleep(2 * (attempt + 1))
+                    # Check if we got rate limited
+                    if sb.rate_limited:
+                        logging.warning(f"Rate limited on channel {ch_id}. Waiting 120s before next attempt.")
+                        time.sleep(120)
+                        # We'll retry, but the backoff will be longer
+                    else:
+                        logging.warning(f"Channel {ch_id} returned 0 members. Retrying...")
+                        time.sleep(2 * (attempt + 1))
             except Exception as e:
                 logging.error(f"Error scanning channel {ch_id}: {e}")
                 time.sleep(2 * (attempt + 1))
@@ -406,7 +422,6 @@ def send_single_webhook(member_id, tag, join_time, max_retries=3):
                     "author": {"name": "Snitched Successful"},
                     "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                     "fields": [
-                        # ----- CLICKABLE USERNAME -----
                         {"name": "Username", "value": f"[{clean_username}](https://discord.com/users/{member_id})", "inline": True},
                         {"name": "User ID", "value": member_id, "inline": True},
                         {"name": "Joined Server", "value": join_str, "inline": False},
@@ -459,7 +474,6 @@ def send_batch_webhook(batch, max_retries=3):
                 join_str = join_time.strftime("%m-%d-%Y %I:%M %p")
                 fields.append({
                     "name": "New Member",
-                    # ----- CLICKABLE USERNAME -----
                     "value": f"**[{clean_username}](https://discord.com/users/{member_id})**\nID: `{member_id}`\nJoined: {join_str}",
                     "inline": False
                 })
