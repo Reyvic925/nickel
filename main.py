@@ -15,6 +15,8 @@ if 'DISCORD_TOKEN' in os.environ:
         channelIds = [ch.strip() for ch in channel_id_env.split(',') if ch.strip()]
     else:
         channelIds = [channel_id_env] if channel_id_env else []
+    # Deduplicate channel IDs
+    channelIds = list(dict.fromkeys(channelIds))
     webhook = os.environ.get('DISCORD_WEBHOOK')
     proxy = os.environ.get('DISCORD_PROXY', '')
     blacklistedRoles = json.loads(os.environ.get('DISCORD_BLACKLISTED_ROLES', '[]'))
@@ -35,6 +37,8 @@ else:
         channelIds = [config['channelId']]
     else:
         channelIds = []
+    # Deduplicate channel IDs
+    channelIds = list(dict.fromkeys(channelIds))
     token = config.get('token')
     webhook = config.get('webhook')
     proxy = config.get('proxy', '')
@@ -311,7 +315,6 @@ class DiscordSocket(websocket.WebSocketApp):
         pass
 
 # ---------- Helpers ----------
-# <<< NEW: Fetch member info from API when joined_at is missing >>>
 def fetch_member_joined_at(user_id):
     """Fetch the joined_at timestamp for a specific user from Discord API."""
     try:
@@ -403,7 +406,8 @@ def send_single_webhook(member_id, tag, join_time, max_retries=3):
                     "author": {"name": "Snitched Successful"},
                     "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                     "fields": [
-                        {"name": "Username", "value": clean_username, "inline": True},
+                        # ----- CLICKABLE USERNAME -----
+                        {"name": "Username", "value": f"[{clean_username}](https://discord.com/users/{member_id})", "inline": True},
                         {"name": "User ID", "value": member_id, "inline": True},
                         {"name": "Joined Server", "value": join_str, "inline": False},
                         {"name": "Mention", "value": f"<@{member_id}>", "inline": True},
@@ -455,7 +459,8 @@ def send_batch_webhook(batch, max_retries=3):
                 join_str = join_time.strftime("%m-%d-%Y %I:%M %p")
                 fields.append({
                     "name": "New Member",
-                    "value": f"**{clean_username}**\nID: `{member_id}`\nJoined: {join_str}",
+                    # ----- CLICKABLE USERNAME -----
+                    "value": f"**[{clean_username}](https://discord.com/users/{member_id})**\nID: `{member_id}`\nJoined: {join_str}",
                     "inline": False
                 })
             embed = {
