@@ -151,15 +151,22 @@ class DiscordSocket(websocket.WebSocketApp):
         self.packets_recv = 0
         self.rate_limited = False   # flag to indicate we got a rate limit close
 
-    # ---------- CHANGED: run with timeout ----------
-    def run(self, timeout=30):
+    # ---------- FIXED: custom timeout without using run_forever(timeout=...) ----------
+    def run(self, timeout=60):
         """
         Run the WebSocket with a timeout (seconds).
         If the scrape doesn't complete within timeout, the socket is closed and we return whatever we have.
         """
-        self.run_forever(timeout=timeout)
+        # Start a timer that will close the socket after `timeout` seconds
+        timer = threading.Timer(timeout, self.close)
+        timer.daemon = True
+        timer.start()
+        # Run the WebSocket (blocks until closed)
+        self.run_forever()
+        # Cancel the timer if we finished before timeout
+        timer.cancel()
         return self.members
-    # ------------------------------------------------
+    # ------------------------------------------------------------
 
     def scrapeUsers(self):
         if self.endScraping:
@@ -352,7 +359,7 @@ def autoSnitch(token, guild_id, channel_ids, max_retries=3):
             try:
                 logging.info(f"Scanning channel {ch_id} (attempt {attempt+1}/{max_retries}) ...")
                 sb = DiscordSocket(token, guild_id, ch_id)
-                result = sb.run(timeout=30)   # timeout after 30 seconds
+                result = sb.run(timeout=45)   # 45 seconds timeout
                 if result:
                     logging.info(f"Channel {ch_id} returned {len(result)} members.")
                     all_members.update(result)
