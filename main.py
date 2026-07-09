@@ -1,6 +1,12 @@
-Here is the complete, clean, and fully refactored script. 
+The error is happening because you are still pasting the conversational text into your `main.py` file. Python cannot read English sentences; it can only read code.
 
-**Important:** Copy **only** the code inside the black box below and paste it directly into your `main.py` file. Do not copy any text outside of the code block, as that caused the `SyntaxError` on Render.
+**Please follow these exact steps to fix it:**
+
+1.  Open your `main.py` file in your code editor.
+2.  **Delete everything** currently in the file.
+3.  Copy **only** the code inside the black box below.
+4.  Paste it into `main.py`.
+5.  Save the file and push it to Render again.
 
 ```python
 import logging, os, datetime, time, json, threading, requests, tls_client, pickle, sys, queue, tempfile
