@@ -1,19 +1,8 @@
-The error is happening because you are still pasting the conversational text into your `main.py` file. Python cannot read English sentences; it can only read code.
-
-**Please follow these exact steps to fix it:**
-
-1.  Open your `main.py` file in your code editor.
-2.  **Delete everything** currently in the file.
-3.  Copy **only** the code inside the black box below.
-4.  Paste it into `main.py`.
-5.  Save the file and push it to Render again.
-
-```python
 import logging, os, datetime, time, json, threading, requests, tls_client, pickle, sys, queue, tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 # ---------- Global defaults ----------
-DEFAULT_SCAN_INTERVAL = 60          # not used for persistent, kept for fallback
+DEFAULT_SCAN_INTERVAL = 60          # not used for persistent, kept for compatibility
 DEFAULT_BATCH_SIZE = 20
 DEFAULT_INDIVIDUAL_THRESHOLD = 5
 DEFAULT_JOIN_WINDOW = 2 * 24 * 60 * 60
@@ -33,7 +22,7 @@ class ProfileLogger(logging.LoggerAdapter):
 # ---------- WebSocket imports ----------
 try:
     import websocket
-except ImportError:
+except:
     os.system("pip install websocket-client")
     import websocket
 
@@ -550,10 +539,10 @@ class PersistentSnitch(websocket.WebSocketApp):
         self.packets_recv = 0
         self.auth_failed = False
         self.running = True
-        
+
         # Webhook queue to prevent blocking the WebSocket thread
         self.webhook_queue = queue.Queue()
-        
+
         # Start background webhook sender
         threading.Thread(target=self._webhook_sender_loop, daemon=True).start()
 
@@ -745,13 +734,13 @@ class PersistentSnitch(websocket.WebSocketApp):
                 return
 
             self.notified_set.add(member_id)
-            
+
             # Queue the webhook instead of sending it synchronously
             self.webhook_queue.put((
                 member_id, tag, join_time,
                 self.webhook_url, self.token, self.guild_id
             ))
-            
+
             # Save cache atomically
             save_cache_atomic(f"notified_{self.guild_id}.pkl", self.notified_set)
 
@@ -963,4 +952,3 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         logging.info("Shutting down...")
         sys.exit(0)
-```
