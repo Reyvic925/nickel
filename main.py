@@ -149,24 +149,15 @@ class DiscordSocket(websocket.WebSocketApp):
         self.ranges = [[0, 0]]
         self.lastRange = 0
         self.packets_recv = 0
-        self.rate_limited = False   # flag to indicate we got a rate limit close
+        self.rate_limited = False
 
-    # ---------- FIXED: custom timeout without using run_forever(timeout=...) ----------
     def run(self, timeout=60):
-        """
-        Run the WebSocket with a timeout (seconds).
-        If the scrape doesn't complete within timeout, the socket is closed and we return whatever we have.
-        """
-        # Start a timer that will close the socket after `timeout` seconds
         timer = threading.Timer(timeout, self.close)
         timer.daemon = True
         timer.start()
-        # Run the WebSocket (blocks until closed)
         self.run_forever()
-        # Cancel the timer if we finished before timeout
         timer.cancel()
         return self.members
-    # ------------------------------------------------------------
 
     def scrapeUsers(self):
         if self.endScraping:
@@ -326,7 +317,6 @@ class DiscordSocket(websocket.WebSocketApp):
             logging.error(f"Error in sock_message: {e}")
 
     def sock_close(self, ws, close_code, close_msg):
-        # Detect rate limit close codes (1008, 4009, or message contains "Rate limited")
         if close_msg and "Rate limited" in close_msg:
             self.rate_limited = True
             logging.warning(f"Rate limit detected on channel {self.channel_id}.")
@@ -430,6 +420,7 @@ def send_single_webhook(member_id, tag, join_time, max_retries=3):
                     "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                     "fields": [
                         {"name": "Username", "value": f"[{clean_username}](https://discord.com/users/{member_id})", "inline": True},
+                        {"name": "Full Tag (copy)", "value": f"`{tag}`", "inline": True},
                         {"name": "User ID", "value": member_id, "inline": True},
                         {"name": "Joined Server", "value": join_str, "inline": False},
                         {"name": "Mention", "value": f"<@{member_id}>", "inline": True},
@@ -481,7 +472,12 @@ def send_batch_webhook(batch, max_retries=3):
                 join_str = join_time.strftime("%m-%d-%Y %I:%M %p")
                 fields.append({
                     "name": "New Member",
-                    "value": f"**[{clean_username}](https://discord.com/users/{member_id})**\nID: `{member_id}`\nJoined: {join_str}",
+                    "value": (
+                        f"**Full Tag (copy):** `{tag}`\n"
+                        f"**Profile:** [{clean_username}](https://discord.com/users/{member_id})\n"
+                        f"**ID:** `{member_id}`\n"
+                        f"**Joined:** {join_str}"
+                    ),
                     "inline": False
                 })
             embed = {
