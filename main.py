@@ -9,6 +9,7 @@ import tls_client
 import pickle
 import random
 from threading import Semaphore
+from urllib.parse import urlparse
 
 # ---------- Read configuration ----------
 if 'DISCORD_TOKEN' in os.environ:
@@ -109,7 +110,7 @@ class RateLimiter:
 rest_limiter = RateLimiter(30, 1)      # 30 REST calls per second
 webhook_limiter = RateLimiter(5, 1)    # 5 webhook sends per second
 
-# ---------- Global Session ----------
+# ---------- Global Session (with proxy validation) ----------
 shared_session = None
 
 def get_session():
@@ -133,8 +134,21 @@ def get_session():
             'x-discord-locale': 'en-US',
             'x-super-properties': 'eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiRGlzY29yZCBDbGllbnQiLCJyZWxlYXNlX2NoYW5uZWwiOiJjYW5hcnkiLCJjbGllbnRfdmVyc2lvbiI6IjEuMC41OSIsIm9zX3ZlcnNpb24iOiIxMC4wLjIyNjIxIiwib3NfYXJjaCI6Ing2NCIsInN5c3RlbV9sb2NhbGUiOiJlbi1VUyIsImNsaWVudF9idWlsZF9udW1iZXIiOjE4MTk2NywibmF0aXZlX2J1aWxkX251bWJlciI6MzA4NTIsImNsaWVudF9ldmVudF9zb3VyY2UiOm51bGwsImRlc2lnbl9pZCI6MH0='
         })
+        # -------------------- PROXY VALIDATION (OPTION 2) --------------------
         if proxy:
-            shared_session.proxies = {'http': 'http://%s' % proxy, 'https': 'http://%s' % proxy}
+            proxy_url = proxy
+            if '://' not in proxy_url:
+                proxy_url = 'http://' + proxy_url
+            try:
+                parsed = urlparse(proxy_url)
+                if parsed.hostname:
+                    shared_session.proxies = {'http': proxy_url, 'https': proxy_url}
+                    logging.info(f"Proxy set: {parsed.hostname}:{parsed.port or 'default'}")
+                else:
+                    raise ValueError("No hostname in proxy URL")
+            except Exception as e:
+                logging.warning(f"Invalid proxy format '{proxy}', ignoring proxy: {e}")
+        # --------------------------------------------------------------------
     return shared_session
 
 # ---------- API Helpers ----------
