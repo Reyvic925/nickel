@@ -8,6 +8,7 @@ import requests
 import tls_client
 import pickle
 import random
+import re
 from threading import Semaphore
 from urllib.parse import urlparse
 
@@ -25,13 +26,12 @@ if 'DISCORD_TOKEN' in os.environ:
         channelIds = [ch.strip() for ch in channel_id_env.split(',') if ch.strip()]
     else:
         channelIds = [channel_id_env] if channel_id_env else []
-    # Deduplicate channel IDs
     channelIds = list(dict.fromkeys(channelIds))
     webhook = os.environ.get('DISCORD_WEBHOOK')
     proxy = os.environ.get('DISCORD_PROXY', '')
     blacklistedRoles = json.loads(os.environ.get('DISCORD_BLACKLISTED_ROLES', '[]'))
     blacklistedUsers = json.loads(os.environ.get('DISCORD_BLACKLISTED_USERS', '[]'))
-    scan_interval = int(os.environ.get('SCAN_INTERVAL', '300'))          # 5 minutes default
+    scan_interval = int(os.environ.get('SCAN_INTERVAL', '300'))
     BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '20'))
     INDIVIDUAL_THRESHOLD = int(os.environ.get('INDIVIDUAL_THRESHOLD', '5'))
 else:
@@ -107,10 +107,21 @@ class RateLimiter:
                 self.calls = 0
             self.calls += 1
 
-rest_limiter = RateLimiter(30, 1)      # 30 REST calls per second
-webhook_limiter = RateLimiter(5, 1)    # 5 webhook sends per second
+rest_limiter = RateLimiter(30, 1)
+webhook_limiter = RateLimiter(5, 1)
 
-# ---------- Global Session (with proxy validation) ----------
+# ---------- Proxy validation ----------
+def is_valid_proxy_host(hostname):
+    # IPv4 pattern
+    ipv4_re = r'^(\d{1,3}\.){3}\d{1,3}$'
+    if re.match(ipv4_re, hostname):
+        parts = hostname.split('.')
+        return all(0 <= int(p) <= 255 for p in parts)
+    # Domain name: at least one dot, and only letters, digits, hyphens, dots
+    domain_re = r'^(?=.{1,253}$)(?!-)(?:[a-zA-Z0-9-]{1,63}\.)+[a-zA-Z]{2,63}$'
+    return bool(re.match(domain_re, hostname))
+
+# ---------- Global Session ----------
 shared_session = None
 
 def get_session():
@@ -134,29 +145,25 @@ def get_session():
             'x-discord-locale': 'en-US',
             'x-super-properties': 'eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiRGlzY29yZCBDbGllbnQiLCJyZWxlYXNlX2NoYW5uZWwiOiJjYW5hcnkiLCJjbGllbnRfdmVyc2lvbiI6IjEuMC41OSIsIm9zX3ZlcnNpb24iOiIxMC4wLjIyNjIxIiwib3NfYXJjaCI6Ing2NCIsInN5c3RlbV9sb2NhbGUiOiJlbi1VUyIsImNsaWVudF9idWlsZF9udW1iZXIiOjE4MTk2NywibmF0aXZlX2J1aWxkX251bWJlciI6MzA4NTIsImNsaWVudF9ldmVudF9zb3VyY2UiOm51bGwsImRlc2lnbl9pZCI6MH0='
         })
-        # -------------------- PROXY VALIDATION (OPTION 2) --------------------
+        # ----- Proxy validation (improved) -----
         if proxy:
             proxy_url = proxy
             if '://' not in proxy_url:
                 proxy_url = 'http://' + proxy_url
             try:
                 parsed = urlparse(proxy_url)
-                if parsed.hostname:
+                host = parsed.hostname
+                if host and is_valid_proxy_host(host):
                     shared_session.proxies = {'http': proxy_url, 'https': proxy_url}
-                    logging.info(f"Proxy set: {parsed.hostname}:{parsed.port or 'default'}")
+                    logging.info(f"✅ Proxy set: {host}:{parsed.port or 'default'}")
                 else:
-                    raise ValueError("No hostname in proxy URL")
+                    logging.warning(f"❌ Invalid proxy host '{host}' – ignoring proxy.")
             except Exception as e:
-                logging.warning(f"Invalid proxy format '{proxy}', ignoring proxy: {e}")
-        # --------------------------------------------------------------------
+                logging.warning(f"❌ Invalid proxy format '{proxy}': {e} – ignoring.")
     return shared_session
 
 # ---------- API Helpers ----------
 def fetch_all_members(guild_id, max_retries=3):
-    """
-    Fetch all members of the guild using REST pagination.
-    Returns a dict: {user_id: (tag, joined_at)}
-    """
     members = {}
     after = '0'
     retry_count = 0
@@ -208,9 +215,15 @@ def fetch_all_members(guild_id, max_retries=3):
             if len(data) < 1000:
                 break
             after = data[-1]['user']['id']
-            retry_count = 0  # reset on successful page
+            retry_count = 0
 
         except Exception as e:
+            error_msg = str(e)
+            if "no such host" in error_msg.lower() or "dial tcp" in error_msg.lower():
+                # DNS error – proxy likely invalid → remove it and retry
+                logging.warning(f"DNS error with proxy – removing proxy and retrying.")
+                if shared_session:
+                    shared_session.proxies = {}  # clear proxy
             logging.error(f"Error in fetch_all_members: {e}")
             retry_count += 1
             if retry_count > max_retries:
@@ -220,7 +233,6 @@ def fetch_all_members(guild_id, max_retries=3):
     return members
 
 def fetch_member_joined_at(user_id):
-    """Fetch joined_at for a single user via API (fallback)."""
     try:
         rest_limiter.acquire()
         sess = get_session()
@@ -234,13 +246,12 @@ def fetch_member_joined_at(user_id):
         logging.error(f"Error fetching member {user_id}: {e}")
         return None
 
-# ---------- Webhook Sending (with rate limiting and retry) ----------
+# ---------- Webhook Sending ----------
 def send_single_webhook(member_id, tag, join_time, max_retries=3):
     attempt = 0
     wait_time = 2
     while attempt <= max_retries:
         try:
-            # Get guild name (cached? we'll fetch once per scan, but for simplicity fetch each time)
             rest_limiter.acquire()
             guild_resp = get_session().get(f'https://discord.com/api/v9/guilds/{guildId}')
             guild_name = guild_resp.json().get('name', 'Unknown') if guild_resp.status_code == 200 else 'Unknown'
@@ -364,7 +375,6 @@ def process_new_members(new_members_dict):
     pending = []
 
     for member_id, (tag, joined_at) in new_members_dict.items():
-        # If joined_at is missing, try to fetch it once (fallback)
         if not joined_at:
             logging.info(f"Missing joined_at for {member_id}, fetching via API...")
             joined_at = fetch_member_joined_at(member_id)
@@ -399,14 +409,12 @@ def process_new_members(new_members_dict):
         logging.info(f"📨 Sending {len(pending)} members individually.")
         for item in pending:
             send_single_webhook(item['member_id'], item['tag'], item['join_time'])
-            # Jitter to spread requests
             time.sleep(random.uniform(1.0, 3.0))
     else:
         logging.info(f"📦 Sending {len(pending)} members in batches of {BATCH_SIZE}.")
         for i in range(0, len(pending), BATCH_SIZE):
             batch = pending[i:i+BATCH_SIZE]
             send_batch_webhook(batch)
-            # Delay between batches
             time.sleep(random.uniform(1.0, 3.0))
 
     save_notified_cache()
@@ -473,24 +481,19 @@ if __name__ == '__main__':
 
     wait_for_webhook_ready()
 
-    # Initial baseline
     logging.info("Building initial baseline (fetching all members)...")
     current_members = fetch_all_members(guildId)
     logging.info("Baseline built: %s members visible.", len(current_members))
 
-    # Check baseline for recent joins
     logging.info("Checking baseline members for recent joins...")
     process_new_members(current_members)
 
-    # Main loop
     while True:
-        # Jitter to avoid exact periodic bursts
         time.sleep(random.uniform(0, 5))
         logging.info("Fetching member list...")
         new_members = fetch_all_members(guildId)
         logging.info("Fetched: %s members visible.", len(new_members))
 
-        # Detect new members by ID difference
         current_ids = set(current_members.keys())
         new_ids = set(new_members.keys())
         diff_ids = new_ids - current_ids
