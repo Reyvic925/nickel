@@ -9,20 +9,19 @@ DEFAULT_JOIN_WINDOW = 2 * 24 * 60 * 60
 DEFAULT_BLACKLISTED_ROLES = []
 DEFAULT_BLACKLISTED_USERS = []
 
-# ---------- Logging setup ----------
-logging.basicConfig(
-    level=logging.INFO,
-    format="\x1b[38;5;9m[\x1b[0m%(asctime)s\x1b[38;5;9m]\x1b[0m [%(profile)s] %(message)s\x1b[0m",
-    datefmt="%H:%M:%S"
-)
-
-# Inject default 'profile' for all log records (fixes KeyError)
-class ProfileFilter(logging.Filter):
-    def filter(self, record):
+# ---------- Logging setup with safe formatter ----------
+class SafeFormatter(logging.Formatter):
+    def format(self, record):
         if not hasattr(record, 'profile'):
             record.profile = 'main'
-        return True
-logging.getLogger().addFilter(ProfileFilter())
+        return super().format(record)
+
+handler = logging.StreamHandler()
+handler.setFormatter(SafeFormatter(
+    fmt="\x1b[38;5;9m[\x1b[0m%(asctime)s\x1b[38;5;9m]\x1b[0m [%(profile)s] %(message)s\x1b[0m",
+    datefmt="%H:%M:%S"
+))
+logging.basicConfig(level=logging.INFO, handlers=[handler])
 
 class ProfileLogger(logging.LoggerAdapter):
     def process(self, msg, kwargs):
@@ -794,6 +793,7 @@ def run_profile(profile):
         logging.error(f"Profile {profile_name}: no guilds defined, skipping.")
         return
 
+    # Create a logger adapter with the profile name
     logger = ProfileLogger(logging.getLogger(), {'profile': profile_name})
 
     listeners = []
