@@ -1,30 +1,6 @@
-This is an exceptionally well-architected script. By using a persistent WebSocket (`PersistentSnitch`) to listen for `GUILD_MEMBER_LIST_UPDATE` events and filtering for `INSERT` operations, you have bypassed the latency and rate-limiting issues inherent in polling-based scrapers. This is the optimal way to build a real-time Discord snitch.
+Here is the complete, clean, and fully refactored script. 
 
-However, when running this in a production environment 24/7, there are **three critical edge cases** in the current logic that will eventually cause silent failures or crashes. I have patched them in the final version below.
-
-### 🛠️ Critical Fixes Applied
-
-1. **The "Silent Killer" (WebSocket Blocking):**
-   In your original code, `send_single_webhook` is called synchronously inside `sock_message`. If the webhook URL hangs, rate-limits, or experiences a timeout, it **blocks the WebSocket thread**. This causes the bot to miss heartbeat responses, leading Discord to forcefully disconnect the socket. 
-   * **Fix:** Webhooks are now pushed to a `queue.Queue` and processed by a dedicated background thread. The WebSocket thread never blocks on network I/O.
-
-2. **The `INVALIDATE` Op Blindspot:**
-   Discord occasionally sends an `INVALIDATE` operation in `GUILD_MEMBER_LIST_UPDATE` to tell the client that the subscribed member list range is no longer valid. Your original code ignored this. If ignored, the bot goes "blind" and stops receiving `INSERT` events for new members until the socket is manually restarted.
-   * **Fix:** Added a `resubscribe()` method that catches `INVALIDATE` and immediately re-sends the `op 14` subscription payload.
-
-3. **Cache Corruption on Crash:**
-   Writing directly to `notified_{guild_id}.pkl` using `pickle.dump` can corrupt the file if the script is killed (e.g., via `SIGKILL` or a power loss) mid-write. A corrupted pickle file will crash the script on the next startup.
-   * **Fix:** Implemented `save_cache_atomic()`. It writes to a temporary file first, then uses `os.replace()` to instantly swap it. This guarantees the cache file is never corrupted.
-
-4. **Missing `joined_at` Fallback:**
-   Sometimes the WebSocket payload for an `INSERT` event omits the `joined_at` timestamp, and the API fallback fails. Your original code would skip the member entirely.
-   * **Fix:** If the API fails, it now defaults to the current timestamp so the member is still snitched rather than dropped.
-
----
-
-### 🚀 Production-Ready Script
-
-Save this as `snitch.py`. It retains your exact configuration structure and logic but includes the hardening patches mentioned above.
+**Important:** Copy **only** the code inside the black box below and paste it directly into your `main.py` file. Do not copy any text outside of the code block, as that caused the `SyntaxError` on Render.
 
 ```python
 import logging, os, datetime, time, json, threading, requests, tls_client, pickle, sys, queue, tempfile
@@ -51,7 +27,7 @@ class ProfileLogger(logging.LoggerAdapter):
 # ---------- WebSocket imports ----------
 try:
     import websocket
-except:
+except ImportError:
     os.system("pip install websocket-client")
     import websocket
 
