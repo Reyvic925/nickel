@@ -2,7 +2,7 @@ import logging, os, datetime, time, json, threading, requests, tls_client, pickl
 from concurrent.futures import ThreadPoolExecutor
 
 # ---------- Global defaults ----------
-DEFAULT_SCAN_INTERVAL = 60          # not used for persistent, kept for compatibility
+DEFAULT_SCAN_INTERVAL = 60
 DEFAULT_BATCH_SIZE = 20
 DEFAULT_INDIVIDUAL_THRESHOLD = 5
 DEFAULT_JOIN_WINDOW = 2 * 24 * 60 * 60
@@ -15,6 +15,15 @@ logging.basicConfig(
     format="\x1b[38;5;9m[\x1b[0m%(asctime)s\x1b[38;5;9m]\x1b[0m [%(profile)s] %(message)s\x1b[0m",
     datefmt="%H:%M:%S"
 )
+
+# Inject default 'profile' for all log records (fixes KeyError)
+class ProfileFilter(logging.Filter):
+    def filter(self, record):
+        if not hasattr(record, 'profile'):
+            record.profile = 'main'
+        return True
+logging.getLogger().addFilter(ProfileFilter())
+
 class ProfileLogger(logging.LoggerAdapter):
     def process(self, msg, kwargs):
         return msg, kwargs
@@ -28,7 +37,6 @@ except:
 
 # ---------- Helper: Atomic Cache Saving ----------
 def save_cache_atomic(filepath, data):
-    """Saves data to a pickle file atomically to prevent corruption on crash."""
     dir_name = os.path.dirname(filepath) or '.'
     try:
         with tempfile.NamedTemporaryFile(dir=dir_name, delete=False, mode='wb') as f:
@@ -234,11 +242,10 @@ def process_new_members(new_members_dict, guild_id, webhook_url, token,
             if i + batch_size < len(pending):
                 time.sleep(2)
 
-    # Save cache atomically
     save_cache_atomic(f"notified_{guild_id}.pkl", notified_set)
     logger.info("✅ Finished processing initial members.")
 
-# ---------- Initial full scan (uses existing autoSnitch logic) ----------
+# ---------- Initial full scan ----------
 def autoSnitch(token, guild_id, channel_ids, blacklisted_roles, blacklisted_users, max_retries=3):
     all_members = {}
     for ch_id in channel_ids:
@@ -540,14 +547,10 @@ class PersistentSnitch(websocket.WebSocketApp):
         self.auth_failed = False
         self.running = True
 
-        # Webhook queue to prevent blocking the WebSocket thread
         self.webhook_queue = queue.Queue()
-
-        # Start background webhook sender
         threading.Thread(target=self._webhook_sender_loop, daemon=True).start()
 
     def _webhook_sender_loop(self):
-        """Background thread to process webhooks without blocking the WebSocket."""
         while self.running:
             try:
                 item = self.webhook_queue.get(timeout=1)
@@ -618,7 +621,6 @@ class PersistentSnitch(websocket.WebSocketApp):
                 break
 
     def resubscribe(self):
-        """Re-subscribes to the member list if an INVALIDATE op is received."""
         payload = {
             "op": 14,
             "d": {
@@ -651,7 +653,6 @@ class PersistentSnitch(websocket.WebSocketApp):
                     self.guilds[guild["id"]] = {"member_count": guild.get("member_count", 0)}
 
             if t == "READY_SUPPLEMENTAL":
-                # Subscribe to member list updates for this channel
                 payload = {
                     "op": 14,
                     "d": {
@@ -659,7 +660,7 @@ class PersistentSnitch(websocket.WebSocketApp):
                         "typing": True,
                         "activities": True,
                         "threads": True,
-                        "channels": {self.channel_id: [[0, 99]]}  # small initial sync
+                        "channels": {self.channel_id: [[0, 99]]}
                     }
                 }
                 self.send(json.dumps(payload))
@@ -676,13 +677,11 @@ class PersistentSnitch(websocket.WebSocketApp):
                     elif not isinstance(updates, list):
                         updates = []
 
-                    # Handle INVALIDATE op (Discord telling us to re-subscribe)
                     if op_type == "INVALIDATE":
-                        self.logger.warning("Received INVALIDATE. Re-subscribing to member list...")
+                        self.logger.warning("Received INVALIDATE. Re-subscribing...")
                         self.resubscribe()
                         continue
 
-                    # Only process INSERT ops (new members)
                     if op_type != "INSERT":
                         continue
 
@@ -707,7 +706,6 @@ class PersistentSnitch(websocket.WebSocketApp):
                         tag = f"{username}#{discrim}" if discrim != "0" else f"@{username}"
                         joined_at = mem.get('joined_at')
 
-                        # Process this new member
                         self.process_single_new_member(user_id, tag, joined_at)
 
         except Exception as e:
@@ -720,7 +718,6 @@ class PersistentSnitch(websocket.WebSocketApp):
             self.logger.info(f"Missing joined_at for {member_id}, fetching via API...")
             joined_at = fetch_member_joined_at(member_id, self.token, self.guild_id)
             if not joined_at:
-                # Fallback: use current time if API fails, so we still snitch them
                 self.logger.warning(f"Could not fetch joined_at for {member_id}. Using current time.")
                 joined_at = now.isoformat()
 
@@ -735,13 +732,11 @@ class PersistentSnitch(websocket.WebSocketApp):
 
             self.notified_set.add(member_id)
 
-            # Queue the webhook instead of sending it synchronously
             self.webhook_queue.put((
                 member_id, tag, join_time,
                 self.webhook_url, self.token, self.guild_id
             ))
 
-            # Save cache atomically
             save_cache_atomic(f"notified_{self.guild_id}.pkl", self.notified_set)
 
         except Exception as e:
@@ -788,8 +783,6 @@ def run_profile(profile):
         logging.error(f"Profile {profile_name}: missing token, skipping.")
         return
 
-    # Override defaults
-    scan_interval = profile.get('scan_interval', DEFAULT_SCAN_INTERVAL)  # not used, kept for compatibility
     batch_size = profile.get('batch_size', DEFAULT_BATCH_SIZE)
     individual_threshold = profile.get('individual_threshold', DEFAULT_INDIVIDUAL_THRESHOLD)
     join_window_seconds = profile.get('join_window_seconds', DEFAULT_JOIN_WINDOW)
@@ -803,7 +796,6 @@ def run_profile(profile):
 
     logger = ProfileLogger(logging.getLogger(), {'profile': profile_name})
 
-    # We'll start a persistent listener for each guild
     listeners = []
 
     for g in guilds:
@@ -814,7 +806,6 @@ def run_profile(profile):
             logger.error(f"Guild {guild_id}: no channel IDs, skipping.")
             continue
 
-        # Load notified cache per guild
         cache_file = f"notified_{guild_id}.pkl"
         if os.path.exists(cache_file):
             with open(cache_file, 'rb') as f:
@@ -822,12 +813,10 @@ def run_profile(profile):
         else:
             notified_set = set()
 
-        # --- STEP 1: Initial full scan for this guild ---
         logger.info(f"Performing initial baseline scan for guild {guild_id}...")
         try:
             members = autoSnitch(token, guild_id, channel_ids, blacklisted_roles, blacklisted_users)
             logger.info(f"Guild {guild_id}: {len(members)} members visible.")
-            # Process recent joins from baseline
             process_new_members(members, guild_id, webhook_url, token,
                                 notified_set, join_window_seconds, batch_size, individual_threshold,
                                 logger)
@@ -836,11 +825,9 @@ def run_profile(profile):
             if "Authentication failed" in str(e):
                 logger.error("Token invalid – profile stopped.")
                 return
-            # If baseline fails, we skip this guild
             continue
 
-        # --- STEP 2: Start persistent listener on the first channel (member list is global) ---
-        channel_id = channel_ids[0]  # only need one channel to get member updates
+        channel_id = channel_ids[0]
         logger.info(f"Starting persistent listener for guild {guild_id} on channel {channel_id}...")
         listener = PersistentSnitch(
             token, guild_id, channel_id, webhook_url,
@@ -852,7 +839,6 @@ def run_profile(profile):
         t.start()
         listeners.append(listener)
 
-    # Keep the profile alive (just sleep; listeners run in daemon threads)
     try:
         while True:
             time.sleep(60)
@@ -861,6 +847,23 @@ def run_profile(profile):
 
 # ---------- Config loading ----------
 def load_config():
+    if 'DISCORD_GUILD_CONFIG' in os.environ:
+        token = os.environ.get('DISCORD_TOKEN', '').strip()
+        if not token:
+            raise ValueError("DISCORD_TOKEN is required when using DISCORD_GUILD_CONFIG.")
+        guild_config = json.loads(os.environ.get('DISCORD_GUILD_CONFIG'))
+        profile = {
+            "profile_name": "env_multi_guild",
+            "token": token,
+            "scan_interval": int(os.environ.get('SCAN_INTERVAL', DEFAULT_SCAN_INTERVAL)),
+            "batch_size": int(os.environ.get('BATCH_SIZE', DEFAULT_BATCH_SIZE)),
+            "individual_threshold": int(os.environ.get('INDIVIDUAL_THRESHOLD', DEFAULT_INDIVIDUAL_THRESHOLD)),
+            "blacklistedRoles": json.loads(os.environ.get('DISCORD_BLACKLISTED_ROLES', '[]')),
+            "blacklistedUsers": json.loads(os.environ.get('DISCORD_BLACKLISTED_USERS', '[]')),
+            "guilds": guild_config
+        }
+        return [profile]
+
     if 'DISCORD_TOKEN' in os.environ:
         token = os.environ.get('DISCORD_TOKEN').strip()
         raw_guild = os.environ.get('DISCORD_GUILD_ID', '')
@@ -877,7 +880,7 @@ def load_config():
         if not webhook:
             raise ValueError("DISCORD_WEBHOOK not set in environment.")
         profile = {
-            "profile_name": "env_profile",
+            "profile_name": "env_single_guild",
             "token": token,
             "scan_interval": int(os.environ.get('SCAN_INTERVAL', DEFAULT_SCAN_INTERVAL)),
             "batch_size": int(os.environ.get('BATCH_SIZE', DEFAULT_BATCH_SIZE)),
