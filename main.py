@@ -13,6 +13,28 @@ import websocket
 from threading import Semaphore
 from urllib.parse import urlparse
 
+# ---------- RateLimiter class (MUST be defined before any usage) ----------
+class RateLimiter:
+    def __init__(self, max_calls, period):
+        self.max_calls = max_calls
+        self.period = period
+        self.calls = 0
+        self.lock = Semaphore()
+        self.start = time.time()
+
+    def acquire(self):
+        with self.lock:
+            now = time.time()
+            if now - self.start > self.period:
+                self.start = now
+                self.calls = 0
+            if self.calls >= self.max_calls:
+                sleep_time = self.period - (now - self.start) + 0.1
+                time.sleep(max(0, sleep_time))
+                self.start = time.time()
+                self.calls = 0
+            self.calls += 1
+
 # ---------- Read configuration (multi-format) ----------
 def load_config():
     global token, webhook, proxy, blacklistedRoles, blacklistedUsers, scan_interval, BATCH_SIZE, INDIVIDUAL_THRESHOLD
@@ -39,55 +61,44 @@ def load_config():
         BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '20'))
         INDIVIDUAL_THRESHOLD = int(os.environ.get('INDIVIDUAL_THRESHOLD', '5'))
 
-        # ---- Parse guild-channel mapping ----
         pairs_dict = {}
 
-        # 1) If DISCORD_GUILDS is set (format: "guild1:ch1,ch2;guild2:ch3")
+        # Format 1: DISCORD_GUILDS = "guild1:ch1,ch2;guild2:ch3"
         if 'DISCORD_GUILDS' in os.environ:
             raw = os.environ['DISCORD_GUILDS']
             for entry in raw.split(';'):
                 entry = entry.strip()
-                if not entry:
-                    continue
-                if ':' not in entry:
-                    logging.warning(f"Skipping invalid guild entry (missing ':'): {entry}")
+                if not entry or ':' not in entry:
                     continue
                 guild_part, channels_part = entry.split(':', 1)
                 guild = guild_part.strip()
-                if not guild:
-                    continue
-                # channels part is comma-separated
                 channels = [c.strip() for c in channels_part.split(',') if c.strip()]
-                if not channels:
-                    logging.warning(f"No channels for guild {guild}, skipping.")
+                if not guild or not channels:
                     continue
                 if guild not in pairs_dict:
                     pairs_dict[guild] = channels[0]  # use first channel
                 else:
                     logging.warning(f"Duplicate guild ID {guild} – using first channel only.")
 
-        # 2) Else if DISCORD_GUILD_CONFIG (JSON)
+        # Format 2: DISCORD_GUILD_CONFIG = JSON array
         elif 'DISCORD_GUILD_CONFIG' in os.environ:
             config_list = json.loads(os.environ['DISCORD_GUILD_CONFIG'])
             for entry in config_list:
                 g = entry.get('guildId') or entry.get('guild')
                 channels = entry.get('channels') or entry.get('channelIds') or []
                 if not g or not channels:
-                    logging.warning(f"Skipping invalid config entry: {entry}")
                     continue
                 if g not in pairs_dict:
                     pairs_dict[g] = channels[0]
                 else:
                     logging.warning(f"Duplicate guild ID {g} – using first channel only.")
 
-        # 3) Else if parallel lists
+        # Format 3: parallel lists
         elif 'DISCORD_GUILD_IDS' in os.environ and 'DISCORD_CHANNEL_IDS' in os.environ:
             raw_guilds = os.environ.get('DISCORD_GUILD_IDS', '')
             raw_channels = os.environ.get('DISCORD_CHANNEL_IDS', '')
             guilds = [g.strip() for g in raw_guilds.split(',') if g.strip()]
             channels = [c.strip() for c in raw_channels.split(',') if c.strip()]
-            if not guilds:
-                raise ValueError("No guild IDs provided in DISCORD_GUILD_IDS.")
             if len(guilds) != len(channels):
                 raise ValueError("Number of guild IDs and channel IDs must match.")
             for g, c in zip(guilds, channels):
@@ -96,7 +107,6 @@ def load_config():
                 else:
                     logging.warning(f"Duplicate guild ID {g} – using first channel only.")
 
-        # If we got any pairs, convert to list
         if pairs_dict:
             guild_channel_pairs = list(pairs_dict.items())
         else:
@@ -127,7 +137,7 @@ def load_config():
                         pairs_dict[g] = channels[0]
                 guild_channel_pairs = list(pairs_dict.items())
             else:
-                # old single guild style
+                # old single-guild style
                 g = config.get('guildID') or config.get('guildId')
                 c = config.get('channelId') or config.get('channelIDs')
                 if isinstance(g, list): g = g[0]
@@ -155,12 +165,11 @@ logging.basicConfig(
 JOIN_WINDOW_SECONDS = 2 * 24 * 60 * 60
 NOTIFIED_CACHE_FILE = "notified_members.pkl"
 
-# Load per-guild notified sets
 if os.path.exists(NOTIFIED_CACHE_FILE):
     with open(NOTIFIED_CACHE_FILE, 'rb') as f:
         notified_members = pickle.load(f)
 else:
-    notified_members = {}  # guild_id -> set of user_ids
+    notified_members = {}
 
 def save_notified_cache():
     with open(NOTIFIED_CACHE_FILE, 'wb') as f:
@@ -181,28 +190,6 @@ def get_ws_limiter(guild_id):
     return ws_limiters[guild_id]
 
 webhook_limiter = RateLimiter(2, 1)
-
-# ---------- RateLimiter class ----------
-class RateLimiter:
-    def __init__(self, max_calls, period):
-        self.max_calls = max_calls
-        self.period = period
-        self.calls = 0
-        self.lock = Semaphore()
-        self.start = time.time()
-
-    def acquire(self):
-        with self.lock:
-            now = time.time()
-            if now - self.start > self.period:
-                self.start = now
-                self.calls = 0
-            if self.calls >= self.max_calls:
-                sleep_time = self.period - (now - self.start) + 0.1
-                time.sleep(max(0, sleep_time))
-                self.start = time.time()
-                self.calls = 0
-            self.calls += 1
 
 # ---------- Proxy validation ----------
 def is_valid_proxy_host(hostname):
@@ -253,7 +240,7 @@ def get_session():
                 logging.warning(f"❌ Invalid proxy format '{proxy}': {e} – ignoring.")
     return shared_session
 
-# ---------- REST member fetch (primary) ----------
+# ---------- REST member fetch ----------
 def fetch_all_members_rest(guild_id, max_retries=3):
     members = {}
     after = '0'
@@ -317,7 +304,7 @@ def fetch_all_members_rest(guild_id, max_retries=3):
             time.sleep((2 ** retry_count) + random.uniform(0, 1))
     return members
 
-# ---------- WebSocket fallback (only if REST fails) ----------
+# ---------- WebSocket fallback ----------
 class DiscordSocket(websocket.WebSocketApp):
     def __init__(self, token, guild_id, channel_id):
         self.token = token
@@ -573,16 +560,14 @@ def fetch_all_members_via_websocket(guild_id, channel_id):
 
 # ---------- Unified member fetcher ----------
 def fetch_all_members(guild_id, channel_id):
-    # Try REST first
     rest_members = fetch_all_members_rest(guild_id)
     if rest_members is not None:
         logging.info(f"[Guild {guild_id}] REST fetch successful.")
         return rest_members
-    # Fallback to WebSocket
     logging.info(f"[Guild {guild_id}] Falling back to WebSocket scraping (user token).")
     return fetch_all_members_via_websocket(guild_id, channel_id)
 
-# ---------- Webhook sending (unchanged) ----------
+# ---------- Webhook sending ----------
 def send_single_webhook(guild_id, member_id, tag, join_time, max_retries=3):
     attempt = 0
     wait_time = 2
