@@ -13,52 +13,138 @@ import websocket
 from threading import Semaphore
 from urllib.parse import urlparse
 
-# ---------- Read configuration ----------
-if 'DISCORD_TOKEN' in os.environ:
-    token = os.environ.get('DISCORD_TOKEN')
-    raw_guilds = os.environ.get('DISCORD_GUILD_IDS', '')
-    raw_channels = os.environ.get('DISCORD_CHANNEL_IDS', '')
-    guild_ids = [g.strip() for g in raw_guilds.split(',') if g.strip()]
-    channel_ids = [c.strip() for c in raw_channels.split(',') if c.strip()]
-    if len(guild_ids) != len(channel_ids):
-        raise ValueError("Number of guild IDs and channel IDs must match.")
-    # Build list of (guild_id, channel_id) pairs
-    guild_channel_pairs = list(zip(guild_ids, channel_ids))
-    webhook = os.environ.get('DISCORD_WEBHOOK')
-    proxy = os.environ.get('DISCORD_PROXY', '')
-    blacklistedRoles = json.loads(os.environ.get('DISCORD_BLACKLISTED_ROLES', '[]'))
-    blacklistedUsers = json.loads(os.environ.get('DISCORD_BLACKLISTED_USERS', '[]'))
-    scan_interval = int(os.environ.get('SCAN_INTERVAL', '1800'))  # 30 min between guild swaps
-    BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '20'))
-    INDIVIDUAL_THRESHOLD = int(os.environ.get('INDIVIDUAL_THRESHOLD', '5'))
-else:
-    from json import load
-    config = load(open('config.json'))
-    # For JSON config, we expect a list of objects with 'guildId' and 'channelId'
-    if isinstance(config.get('guilds'), list):
-        guild_channel_pairs = [(item['guildId'], item['channelId']) for item in config['guilds']]
-    else:
-        # fallback to old style
-        guildId = config.get('guildID')
-        if isinstance(guildId, list):
-            guildId = guildId[0]
-        channelId = config.get('channelId')
-        guild_channel_pairs = [(guildId, channelId)]
-    token = config.get('token')
-    webhook = config.get('webhook')
-    proxy = config.get('proxy', '')
-    blacklistedRoles = config.get('blacklistedRoles', [])
-    blacklistedUsers = config.get('blacklistedUsers', [])
-    scan_interval = config.get('scan_interval', 1800)
-    BATCH_SIZE = config.get('batch_size', 20)
-    INDIVIDUAL_THRESHOLD = config.get('individual_threshold', 5)
+# ---------- Read configuration (multi-format) ----------
+def load_config():
+    global token, webhook, proxy, blacklistedRoles, blacklistedUsers, scan_interval, BATCH_SIZE, INDIVIDUAL_THRESHOLD
+    global guild_channel_pairs
 
-if not token:
-    raise ValueError("DISCORD_TOKEN is not set.")
-if not guild_channel_pairs:
-    raise ValueError("No guild-channel pairs provided.")
-if not webhook:
-    raise ValueError("DISCORD_WEBHOOK is not set.")
+    token = None
+    webhook = None
+    proxy = ''
+    blacklistedRoles = []
+    blacklistedUsers = []
+    scan_interval = 1800
+    BATCH_SIZE = 20
+    INDIVIDUAL_THRESHOLD = 5
+    guild_channel_pairs = []
+
+    # Try environment variables first
+    if 'DISCORD_TOKEN' in os.environ:
+        token = os.environ.get('DISCORD_TOKEN')
+        webhook = os.environ.get('DISCORD_WEBHOOK')
+        proxy = os.environ.get('DISCORD_PROXY', '')
+        blacklistedRoles = json.loads(os.environ.get('DISCORD_BLACKLISTED_ROLES', '[]'))
+        blacklistedUsers = json.loads(os.environ.get('DISCORD_BLACKLISTED_USERS', '[]'))
+        scan_interval = int(os.environ.get('SCAN_INTERVAL', '1800'))
+        BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '20'))
+        INDIVIDUAL_THRESHOLD = int(os.environ.get('INDIVIDUAL_THRESHOLD', '5'))
+
+        # ---- Parse guild-channel mapping ----
+        pairs_dict = {}
+
+        # 1) If DISCORD_GUILDS is set (format: "guild1:ch1,ch2;guild2:ch3")
+        if 'DISCORD_GUILDS' in os.environ:
+            raw = os.environ['DISCORD_GUILDS']
+            for entry in raw.split(';'):
+                entry = entry.strip()
+                if not entry:
+                    continue
+                if ':' not in entry:
+                    logging.warning(f"Skipping invalid guild entry (missing ':'): {entry}")
+                    continue
+                guild_part, channels_part = entry.split(':', 1)
+                guild = guild_part.strip()
+                if not guild:
+                    continue
+                # channels part is comma-separated
+                channels = [c.strip() for c in channels_part.split(',') if c.strip()]
+                if not channels:
+                    logging.warning(f"No channels for guild {guild}, skipping.")
+                    continue
+                if guild not in pairs_dict:
+                    pairs_dict[guild] = channels[0]  # use first channel
+                else:
+                    logging.warning(f"Duplicate guild ID {guild} – using first channel only.")
+
+        # 2) Else if DISCORD_GUILD_CONFIG (JSON)
+        elif 'DISCORD_GUILD_CONFIG' in os.environ:
+            config_list = json.loads(os.environ['DISCORD_GUILD_CONFIG'])
+            for entry in config_list:
+                g = entry.get('guildId') or entry.get('guild')
+                channels = entry.get('channels') or entry.get('channelIds') or []
+                if not g or not channels:
+                    logging.warning(f"Skipping invalid config entry: {entry}")
+                    continue
+                if g not in pairs_dict:
+                    pairs_dict[g] = channels[0]
+                else:
+                    logging.warning(f"Duplicate guild ID {g} – using first channel only.")
+
+        # 3) Else if parallel lists
+        elif 'DISCORD_GUILD_IDS' in os.environ and 'DISCORD_CHANNEL_IDS' in os.environ:
+            raw_guilds = os.environ.get('DISCORD_GUILD_IDS', '')
+            raw_channels = os.environ.get('DISCORD_CHANNEL_IDS', '')
+            guilds = [g.strip() for g in raw_guilds.split(',') if g.strip()]
+            channels = [c.strip() for c in raw_channels.split(',') if c.strip()]
+            if not guilds:
+                raise ValueError("No guild IDs provided in DISCORD_GUILD_IDS.")
+            if len(guilds) != len(channels):
+                raise ValueError("Number of guild IDs and channel IDs must match.")
+            for g, c in zip(guilds, channels):
+                if g not in pairs_dict:
+                    pairs_dict[g] = c
+                else:
+                    logging.warning(f"Duplicate guild ID {g} – using first channel only.")
+
+        # If we got any pairs, convert to list
+        if pairs_dict:
+            guild_channel_pairs = list(pairs_dict.items())
+        else:
+            raise ValueError("No guild configuration found. Provide DISCORD_GUILDS, DISCORD_GUILD_CONFIG, or DISCORD_GUILD_IDS+CHANNEL_IDS.")
+
+    else:
+        # Fallback to config.json
+        try:
+            with open('config.json', 'r') as f:
+                config = json.load(f)
+            token = config.get('token')
+            webhook = config.get('webhook')
+            proxy = config.get('proxy', '')
+            blacklistedRoles = config.get('blacklistedRoles', [])
+            blacklistedUsers = config.get('blacklistedUsers', [])
+            scan_interval = config.get('scan_interval', 1800)
+            BATCH_SIZE = config.get('batch_size', 20)
+            INDIVIDUAL_THRESHOLD = config.get('individual_threshold', 5)
+
+            if 'guilds' in config and isinstance(config['guilds'], list):
+                pairs_dict = {}
+                for item in config['guilds']:
+                    g = item.get('guildId') or item.get('guild')
+                    channels = item.get('channels') or item.get('channelIds') or []
+                    if not g or not channels:
+                        continue
+                    if g not in pairs_dict:
+                        pairs_dict[g] = channels[0]
+                guild_channel_pairs = list(pairs_dict.items())
+            else:
+                # old single guild style
+                g = config.get('guildID') or config.get('guildId')
+                c = config.get('channelId') or config.get('channelIDs')
+                if isinstance(g, list): g = g[0]
+                if isinstance(c, list): c = c[0]
+                if g and c:
+                    guild_channel_pairs = [(g, c)]
+        except FileNotFoundError:
+            raise ValueError("No configuration found. Set environment variables or provide config.json.")
+
+    if not token:
+        raise ValueError("DISCORD_TOKEN is not set.")
+    if not webhook:
+        raise ValueError("DISCORD_WEBHOOK is not set.")
+    if not guild_channel_pairs:
+        raise ValueError("No guild-channel pairs configured.")
+
+load_config()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -86,12 +172,12 @@ ws_limiters = {}
 
 def get_rest_limiter(guild_id):
     if guild_id not in rest_limiters:
-        rest_limiters[guild_id] = RateLimiter(1, 1)   # 1 per second
+        rest_limiters[guild_id] = RateLimiter(1, 1)
     return rest_limiters[guild_id]
 
 def get_ws_limiter(guild_id):
     if guild_id not in ws_limiters:
-        ws_limiters[guild_id] = RateLimiter(1, 1)     # 1 per second
+        ws_limiters[guild_id] = RateLimiter(1, 1)
     return ws_limiters[guild_id]
 
 webhook_limiter = RateLimiter(2, 1)
@@ -621,7 +707,6 @@ def process_new_members(guild_id, new_members_dict):
         return
     now = datetime.datetime.now(datetime.timezone.utc)
     pending = []
-    # Get or create notified set for this guild
     if guild_id not in notified_members:
         notified_members[guild_id] = set()
     guild_notified = notified_members[guild_id]
@@ -743,10 +828,11 @@ if __name__ == '__main__':
 
     webhook_mask = webhook[:40] + "..." if len(webhook) > 40 else webhook
     logging.info("Configuration: %d guild(s), webhook: %s", len(guild_channel_pairs), webhook_mask)
+    for g, c in guild_channel_pairs:
+        logging.info(f"  Guild {g} → channel {c}")
 
     wait_for_webhook_ready()
 
-    # We'll store previous member dict per guild to diff
     previous_members = {}  # guild_id -> {user_id: (tag, joined_at)}
 
     # Initial baseline: scan all guilds once
@@ -756,7 +842,6 @@ if __name__ == '__main__':
         if members:
             previous_members[guild_id] = members
             logging.info(f"Baseline for guild {guild_id}: {len(members)} members.")
-            # Process initial members (they might have joined recently)
             process_new_members(guild_id, members)
         else:
             logging.warning(f"Failed to fetch initial members for guild {guild_id}. Skipping.")
@@ -773,7 +858,6 @@ if __name__ == '__main__':
             current_members = fetch_all_members(guild_id, channel_id)
             if current_members is None:
                 logging.error(f"Failed to fetch members for guild {guild_id}. Skipping this cycle.")
-                # Keep old data, but wait before next guild
                 time.sleep(scan_interval + random.uniform(0, 10))
                 continue
 
@@ -788,14 +872,11 @@ if __name__ == '__main__':
             else:
                 logging.info(f"[Guild {guild_id}] No new members detected.")
 
-            # Update stored members for this guild
             previous_members[guild_id] = current_members
 
-            # Wait before moving to next guild (unless it's the last one)
             if guild_id != guild_channel_pairs[-1][0]:
                 logging.info(f"Waiting {scan_interval}s before moving to next guild...")
                 time.sleep(scan_interval + random.uniform(0, 10))
 
-        # After finishing all guilds, the loop starts over from the first
         logging.info("Completed a full cycle. Starting over after a short jitter...")
-        time.sleep(random.uniform(5, 30))  # extra random delay before next cycle
+        time.sleep(random.uniform(5, 30))
