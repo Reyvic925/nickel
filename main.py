@@ -16,54 +16,47 @@ from urllib.parse import urlparse
 # ---------- Read configuration ----------
 if 'DISCORD_TOKEN' in os.environ:
     token = os.environ.get('DISCORD_TOKEN')
-    raw_guild = os.environ.get('DISCORD_GUILD_ID', '')
-    if ',' in raw_guild:
-        guildId = raw_guild.split(',')[0].strip()
-        logging.warning(f"Multiple guild IDs detected, using the first one: {guildId}")
-    else:
-        guildId = raw_guild
-    channel_id_env = os.environ.get('DISCORD_CHANNEL_ID', '')
-    if ',' in channel_id_env:
-        channelIds = [ch.strip() for ch in channel_id_env.split(',') if ch.strip()]
-    else:
-        channelIds = [channel_id_env] if channel_id_env else []
-    channelIds = list(dict.fromkeys(channelIds))
+    raw_guilds = os.environ.get('DISCORD_GUILD_IDS', '')
+    raw_channels = os.environ.get('DISCORD_CHANNEL_IDS', '')
+    guild_ids = [g.strip() for g in raw_guilds.split(',') if g.strip()]
+    channel_ids = [c.strip() for c in raw_channels.split(',') if c.strip()]
+    if len(guild_ids) != len(channel_ids):
+        raise ValueError("Number of guild IDs and channel IDs must match.")
+    # Build list of (guild_id, channel_id) pairs
+    guild_channel_pairs = list(zip(guild_ids, channel_ids))
     webhook = os.environ.get('DISCORD_WEBHOOK')
     proxy = os.environ.get('DISCORD_PROXY', '')
     blacklistedRoles = json.loads(os.environ.get('DISCORD_BLACKLISTED_ROLES', '[]'))
     blacklistedUsers = json.loads(os.environ.get('DISCORD_BLACKLISTED_USERS', '[]'))
-    scan_interval = int(os.environ.get('SCAN_INTERVAL', '300'))  # 5 min default
+    scan_interval = int(os.environ.get('SCAN_INTERVAL', '1800'))  # 30 min between guild swaps
     BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '20'))
     INDIVIDUAL_THRESHOLD = int(os.environ.get('INDIVIDUAL_THRESHOLD', '5'))
 else:
     from json import load
     config = load(open('config.json'))
-    guildId = config.get('guildID')
-    if isinstance(guildId, list):
-        guildId = guildId[0]
-        logging.warning(f"Multiple guild IDs in config, using first: {guildId}")
-    if 'channelIds' in config:
-        channelIds = config['channelIds']
-    elif 'channelId' in config:
-        channelIds = [config['channelId']]
+    # For JSON config, we expect a list of objects with 'guildId' and 'channelId'
+    if isinstance(config.get('guilds'), list):
+        guild_channel_pairs = [(item['guildId'], item['channelId']) for item in config['guilds']]
     else:
-        channelIds = []
-    channelIds = list(dict.fromkeys(channelIds))
+        # fallback to old style
+        guildId = config.get('guildID')
+        if isinstance(guildId, list):
+            guildId = guildId[0]
+        channelId = config.get('channelId')
+        guild_channel_pairs = [(guildId, channelId)]
     token = config.get('token')
     webhook = config.get('webhook')
     proxy = config.get('proxy', '')
     blacklistedRoles = config.get('blacklistedRoles', [])
     blacklistedUsers = config.get('blacklistedUsers', [])
-    scan_interval = config.get('scan_interval', 300)
+    scan_interval = config.get('scan_interval', 1800)
     BATCH_SIZE = config.get('batch_size', 20)
     INDIVIDUAL_THRESHOLD = config.get('individual_threshold', 5)
 
 if not token:
     raise ValueError("DISCORD_TOKEN is not set.")
-if not guildId:
-    raise ValueError("DISCORD_GUILD_ID is not set.")
-if not channelIds:
-    raise ValueError("No channel(s) provided (DISCORD_CHANNEL_ID or channelIds).")
+if not guild_channel_pairs:
+    raise ValueError("No guild-channel pairs provided.")
 if not webhook:
     raise ValueError("DISCORD_WEBHOOK is not set.")
 
@@ -76,17 +69,34 @@ logging.basicConfig(
 JOIN_WINDOW_SECONDS = 2 * 24 * 60 * 60
 NOTIFIED_CACHE_FILE = "notified_members.pkl"
 
+# Load per-guild notified sets
 if os.path.exists(NOTIFIED_CACHE_FILE):
     with open(NOTIFIED_CACHE_FILE, 'rb') as f:
         notified_members = pickle.load(f)
 else:
-    notified_members = set()
+    notified_members = {}  # guild_id -> set of user_ids
 
 def save_notified_cache():
     with open(NOTIFIED_CACHE_FILE, 'wb') as f:
         pickle.dump(notified_members, f)
 
-# ---------- Rate Limiter ----------
+# ---------- Per‑guild rate limiters ----------
+rest_limiters = {}
+ws_limiters = {}
+
+def get_rest_limiter(guild_id):
+    if guild_id not in rest_limiters:
+        rest_limiters[guild_id] = RateLimiter(1, 1)   # 1 per second
+    return rest_limiters[guild_id]
+
+def get_ws_limiter(guild_id):
+    if guild_id not in ws_limiters:
+        ws_limiters[guild_id] = RateLimiter(1, 1)     # 1 per second
+    return ws_limiters[guild_id]
+
+webhook_limiter = RateLimiter(2, 1)
+
+# ---------- RateLimiter class ----------
 class RateLimiter:
     def __init__(self, max_calls, period):
         self.max_calls = max_calls
@@ -102,15 +112,11 @@ class RateLimiter:
                 self.start = now
                 self.calls = 0
             if self.calls >= self.max_calls:
-                sleep_time = self.period - (now - self.start) + 0.05
+                sleep_time = self.period - (now - self.start) + 0.1
                 time.sleep(max(0, sleep_time))
                 self.start = time.time()
                 self.calls = 0
             self.calls += 1
-
-rest_limiter = RateLimiter(30, 1)
-webhook_limiter = RateLimiter(5, 1)
-ws_limiter = RateLimiter(10, 1)   # WebSocket requests (op 14) limited to 10/s
 
 # ---------- Proxy validation ----------
 def is_valid_proxy_host(hostname):
@@ -161,14 +167,15 @@ def get_session():
                 logging.warning(f"❌ Invalid proxy format '{proxy}': {e} – ignoring.")
     return shared_session
 
-# ---------- REST member fetch (try first) ----------
-def fetch_all_members_rest(guild_id, max_retries=2):
+# ---------- REST member fetch (primary) ----------
+def fetch_all_members_rest(guild_id, max_retries=3):
     members = {}
     after = '0'
     retry_count = 0
+    limiter = get_rest_limiter(guild_id)
     while True:
         try:
-            rest_limiter.acquire()
+            limiter.acquire()
             sess = get_session()
             resp = sess.get(
                 f'https://discord.com/api/v9/guilds/{guild_id}/members',
@@ -176,19 +183,22 @@ def fetch_all_members_rest(guild_id, max_retries=2):
             )
             if resp.status_code == 429:
                 retry_after = resp.json().get('retry_after', 2)
-                logging.warning(f"REST rate limited, waiting {retry_after}s...")
-                time.sleep(retry_after)
+                logging.warning(f"[Guild {guild_id}] REST rate limited, waiting {retry_after}s...")
+                time.sleep(retry_after + random.uniform(0, 0.5))
                 continue
             if resp.status_code == 403:
-                # Missing Access – REST not allowed, return None to trigger fallback
-                logging.warning("REST endpoint returned 403 (Missing Access) – falling back to WebSocket.")
+                logging.warning(f"[Guild {guild_id}] REST endpoint returned 403 (Missing Access) – falling back to WebSocket.")
                 return None
+            if resp.status_code == 401:
+                logging.error("Token invalid or logged out. Stopping.")
+                raise SystemExit("Token invalid – exiting.")
             if resp.status_code != 200:
-                logging.error(f"REST fetch failed: {resp.status_code} - {resp.text[:200]}")
+                logging.error(f"[Guild {guild_id}] REST fetch failed: {resp.status_code} - {resp.text[:200]}")
                 retry_count += 1
                 if retry_count > max_retries:
                     break
-                time.sleep(2 ** retry_count)
+                sleep_time = (2 ** retry_count) + random.uniform(0, 1)
+                time.sleep(sleep_time)
                 continue
             data = resp.json()
             if not data:
@@ -214,14 +224,14 @@ def fetch_all_members_rest(guild_id, max_retries=2):
             after = data[-1]['user']['id']
             retry_count = 0
         except Exception as e:
-            logging.error(f"REST fetch error: {e}")
+            logging.error(f"[Guild {guild_id}] REST fetch error: {e}")
             retry_count += 1
             if retry_count > max_retries:
                 break
-            time.sleep(2 ** retry_count)
+            time.sleep((2 ** retry_count) + random.uniform(0, 1))
     return members
 
-# ---------- WebSocket member fetch (fallback for user tokens) ----------
+# ---------- WebSocket fallback (only if REST fails) ----------
 class DiscordSocket(websocket.WebSocketApp):
     def __init__(self, token, guild_id, channel_id):
         self.token = token
@@ -254,8 +264,9 @@ class DiscordSocket(websocket.WebSocketApp):
         self.rate_limited = False
         self.heartbeat_interval = None
         self.heartbeat_thread = None
+        self.member_count = 0
 
-    def run(self, timeout=45):
+    def run(self, timeout=30):
         timer = threading.Timer(timeout, self.close)
         timer.daemon = True
         timer.start()
@@ -266,7 +277,8 @@ class DiscordSocket(websocket.WebSocketApp):
     def scrapeUsers(self):
         if self.endScraping:
             return
-        ws_limiter.acquire()
+        limiter = get_ws_limiter(self.guild_id)
+        limiter.acquire()
         payload = {
             "op": 14,
             "d": {
@@ -341,9 +353,9 @@ class DiscordSocket(websocket.WebSocketApp):
                 for guild in decoded.get("d", {}).get("guilds", []):
                     self.guilds[guild["id"]] = {"member_count": guild.get("member_count", 0)}
             if t == "READY_SUPPLEMENTAL":
-                member_count = self.guilds.get(self.guild_id, {}).get("member_count", 0)
-                if member_count == 0:
-                    logging.warning(f"⚠️ Member count is 0 for channel {self.channel_id}. Closing socket.")
+                self.member_count = self.guilds.get(self.guild_id, {}).get("member_count", 0)
+                if self.member_count == 0:
+                    logging.warning(f"[Guild {self.guild_id}] Member count is 0. Closing socket.")
                     self.close()
                     return
                 self.ranges = [[0, 99]]
@@ -406,12 +418,16 @@ class DiscordSocket(websocket.WebSocketApp):
                                 self.members[user_id] = (tag, joined_at)
                     if not self.endScraping:
                         self.lastRange += 1
-                        self.ranges = [[self.lastRange * 100, self.lastRange * 100 + 99]]
+                        next_start = self.lastRange * 100
+                        if self.member_count > 0 and next_start >= self.member_count:
+                            self.endScraping = True
+                            break
+                        self.ranges = [[next_start, next_start + 99]]
                         self.scrapeUsers()
                 if self.endScraping:
                     self.close()
         except Exception as e:
-            logging.error(f"WS error: {e}")
+            logging.error(f"[Guild {self.guild_id}] WS error: {e}")
 
     def parseGuildMemberListUpdate(self, response):
         memberdata = {
@@ -443,54 +459,52 @@ class DiscordSocket(websocket.WebSocketApp):
     def sock_close(self, ws, close_code, close_msg):
         if close_msg and "Rate limited" in close_msg:
             self.rate_limited = True
-            logging.warning(f"Rate limit detected on channel {self.channel_id}.")
+            logging.warning(f"[Guild {self.guild_id}] Rate limit detected on channel {self.channel_id}.")
 
-def fetch_all_members_via_websocket(guild_id, channel_ids):
+def fetch_all_members_via_websocket(guild_id, channel_id):
     all_members = {}
-    for ch_id in channel_ids:
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                logging.info(f"WS scanning channel {ch_id} (attempt {attempt+1}/{max_retries}) ...")
-                sb = DiscordSocket(token, guild_id, ch_id)
-                result = sb.run(timeout=45)
-                if result:
-                    logging.info(f"Channel {ch_id} returned {len(result)} members via WS.")
-                    all_members.update(result)
-                    break
+    max_retries = 2
+    for attempt in range(max_retries):
+        try:
+            logging.info(f"[Guild {guild_id}] WS scanning channel {channel_id} (attempt {attempt+1}/{max_retries}) ...")
+            sb = DiscordSocket(token, guild_id, channel_id)
+            result = sb.run(timeout=30)
+            if result:
+                logging.info(f"[Guild {guild_id}] Channel {channel_id} returned {len(result)} members via WS.")
+                all_members.update(result)
+                break
+            else:
+                if sb.rate_limited:
+                    logging.warning(f"[Guild {guild_id}] Rate limited on WS for channel {channel_id}. Waiting 60s.")
+                    time.sleep(60 + random.uniform(0, 10))
                 else:
-                    if sb.rate_limited:
-                        logging.warning(f"Rate limited on WS for channel {ch_id}. Waiting 60s.")
-                        time.sleep(60)
-                    else:
-                        logging.warning(f"Channel {ch_id} returned 0 members. Retrying...")
-                        time.sleep(2 * (attempt + 1))
-            except Exception as e:
-                logging.error(f"WS error for channel {ch_id}: {e}")
-                time.sleep(2 ** attempt)
-        # Delay between channels
-        time.sleep(5)
+                    logging.warning(f"[Guild {guild_id}] Channel {channel_id} returned 0 members. Retrying...")
+                    time.sleep((2 ** (attempt + 1)) + random.uniform(0, 2))
+        except Exception as e:
+            logging.error(f"[Guild {guild_id}] WS error: {e}")
+            time.sleep((2 ** attempt) + random.uniform(0, 1))
     return all_members
 
 # ---------- Unified member fetcher ----------
-def fetch_all_members(guild_id, channel_ids):
+def fetch_all_members(guild_id, channel_id):
     # Try REST first
     rest_members = fetch_all_members_rest(guild_id)
     if rest_members is not None:
-        logging.info("REST fetch successful.")
+        logging.info(f"[Guild {guild_id}] REST fetch successful.")
         return rest_members
     # Fallback to WebSocket
-    logging.info("Falling back to WebSocket scraping (user token).")
-    return fetch_all_members_via_websocket(guild_id, channel_ids)
+    logging.info(f"[Guild {guild_id}] Falling back to WebSocket scraping (user token).")
+    return fetch_all_members_via_websocket(guild_id, channel_id)
 
-# ---------- Webhook Sending (unchanged) ----------
-def send_single_webhook(member_id, tag, join_time, max_retries=3):
+# ---------- Webhook sending (unchanged) ----------
+def send_single_webhook(guild_id, member_id, tag, join_time, max_retries=3):
     attempt = 0
     wait_time = 2
     while attempt <= max_retries:
         try:
+            rest_limiter = get_rest_limiter(guild_id)
             rest_limiter.acquire()
-            guild_resp = get_session().get(f'https://discord.com/api/v9/guilds/{guildId}')
+            guild_resp = get_session().get(f'https://discord.com/api/v9/guilds/{guild_id}')
             guild_name = guild_resp.json().get('name', 'Unknown') if guild_resp.status_code == 200 else 'Unknown'
             if tag.startswith('@'):
                 clean_username = tag[1:]
@@ -500,7 +514,7 @@ def send_single_webhook(member_id, tag, join_time, max_retries=3):
                 clean_username = tag
             join_str = join_time.strftime("%m-%d-%Y on %I:%M %p")
             payload = {
-                "content": f"@here New User Joined {guildId}",
+                "content": f"@here New User Joined {guild_id}",
                 "embeds": [{
                     "color": 161791,
                     "author": {"name": "Snitched Successful"},
@@ -518,7 +532,7 @@ def send_single_webhook(member_id, tag, join_time, max_retries=3):
             webhook_limiter.acquire()
             response = requests.post(webhook, json=payload)
             if response.status_code == 204:
-                logging.info(f"✅ Webhook sent for {member_id}")
+                logging.info(f"✅ Webhook sent for {member_id} in guild {guild_id}")
                 return
             elif response.status_code == 429:
                 try:
@@ -528,7 +542,7 @@ def send_single_webhook(member_id, tag, join_time, max_retries=3):
                     retry_after = wait_time
                 wait_time = max(wait_time, retry_after)
                 logging.warning(f"Webhook rate limited for {member_id}, waiting {wait_time}s...")
-                time.sleep(wait_time)
+                time.sleep(wait_time + random.uniform(0, 0.5))
                 attempt += 1
                 wait_time = wait_time * 2
                 continue
@@ -538,17 +552,18 @@ def send_single_webhook(member_id, tag, join_time, max_retries=3):
         except Exception as e:
             logging.error(f"Webhook exception: {e}")
             attempt += 1
-            time.sleep(2 ** attempt)
+            time.sleep((2 ** attempt) + random.uniform(0, 1))
 
-def send_batch_webhook(batch, max_retries=3):
+def send_batch_webhook(guild_id, batch, max_retries=3):
     if not batch:
         return
     attempt = 0
     wait_time = 2
     while attempt <= max_retries:
         try:
+            rest_limiter = get_rest_limiter(guild_id)
             rest_limiter.acquire()
-            guild_resp = get_session().get(f'https://discord.com/api/v9/guilds/{guildId}')
+            guild_resp = get_session().get(f'https://discord.com/api/v9/guilds/{guild_id}')
             guild_name = guild_resp.json().get('name', 'Unknown') if guild_resp.status_code == 200 else 'Unknown'
             fields = []
             for item in batch:
@@ -578,7 +593,7 @@ def send_batch_webhook(batch, max_retries=3):
             webhook_limiter.acquire()
             response = requests.post(webhook, json=payload)
             if response.status_code == 204:
-                logging.info(f"✅ Batch webhook sent for {len(batch)} members.")
+                logging.info(f"✅ Batch webhook sent for {len(batch)} members in guild {guild_id}.")
                 return
             elif response.status_code == 429:
                 try:
@@ -588,7 +603,7 @@ def send_batch_webhook(batch, max_retries=3):
                     retry_after = wait_time
                 wait_time = max(wait_time, retry_after)
                 logging.warning(f"Batch rate limited, waiting {wait_time}s...")
-                time.sleep(wait_time)
+                time.sleep(wait_time + random.uniform(0, 0.5))
                 attempt += 1
                 wait_time = wait_time * 2
                 continue
@@ -598,20 +613,25 @@ def send_batch_webhook(batch, max_retries=3):
         except Exception as e:
             logging.error(f"Batch webhook exception: {e}")
             attempt += 1
-            time.sleep(2 ** attempt)
+            time.sleep((2 ** attempt) + random.uniform(0, 1))
 
 # ---------- Processing ----------
-def process_new_members(new_members_dict):
+def process_new_members(guild_id, new_members_dict):
     if not new_members_dict:
         return
     now = datetime.datetime.now(datetime.timezone.utc)
     pending = []
+    # Get or create notified set for this guild
+    if guild_id not in notified_members:
+        notified_members[guild_id] = set()
+    guild_notified = notified_members[guild_id]
+
     for member_id, (tag, joined_at) in new_members_dict.items():
         if not joined_at:
-            logging.info(f"Missing joined_at for {member_id}, fetching via API...")
-            joined_at = fetch_member_joined_at(member_id)
+            logging.info(f"[Guild {guild_id}] Missing joined_at for {member_id}, fetching via API...")
+            joined_at = fetch_member_joined_at(guild_id, member_id)
             if not joined_at:
-                logging.warning(f"Could not fetch joined_at for {member_id}, skipping.")
+                logging.warning(f"[Guild {guild_id}] Could not fetch joined_at for {member_id}, skipping.")
                 continue
         if not isinstance(joined_at, str):
             continue
@@ -619,50 +639,51 @@ def process_new_members(new_members_dict):
             join_time = datetime.datetime.fromisoformat(joined_at.replace('Z', '+00:00'))
             age = (now - join_time).total_seconds()
             if age <= JOIN_WINDOW_SECONDS:
-                if member_id in notified_members:
+                if member_id in guild_notified:
                     continue
                 pending.append({
                     'member_id': member_id,
                     'tag': tag,
                     'join_time': join_time
                 })
-                notified_members.add(member_id)
+                guild_notified.add(member_id)
             else:
-                logging.debug(f"Member {member_id} joined {age/3600:.1f} hours ago, skipping.")
+                logging.debug(f"[Guild {guild_id}] Member {member_id} joined {age/3600:.1f} hours ago, skipping.")
         except Exception as e:
-            logging.warning(f"Error processing {member_id}: {e}")
+            logging.warning(f"[Guild {guild_id}] Error processing {member_id}: {e}")
 
     if not pending:
-        logging.info("No new members within 2‑day window.")
+        logging.info(f"[Guild {guild_id}] No new members within 2‑day window.")
         return
 
     if len(pending) <= INDIVIDUAL_THRESHOLD:
-        logging.info(f"📨 Sending {len(pending)} members individually.")
+        logging.info(f"[Guild {guild_id}] 📨 Sending {len(pending)} members individually.")
         for item in pending:
-            send_single_webhook(item['member_id'], item['tag'], item['join_time'])
+            send_single_webhook(guild_id, item['member_id'], item['tag'], item['join_time'])
             time.sleep(random.uniform(1.0, 3.0))
     else:
-        logging.info(f"📦 Sending {len(pending)} members in batches of {BATCH_SIZE}.")
+        logging.info(f"[Guild {guild_id}] 📦 Sending {len(pending)} members in batches of {BATCH_SIZE}.")
         for i in range(0, len(pending), BATCH_SIZE):
             batch = pending[i:i+BATCH_SIZE]
-            send_batch_webhook(batch)
+            send_batch_webhook(guild_id, batch)
             time.sleep(random.uniform(1.0, 3.0))
 
     save_notified_cache()
-    logging.info("✅ Finished processing new members.")
+    logging.info(f"[Guild {guild_id}] ✅ Finished processing new members.")
 
-def fetch_member_joined_at(user_id):
+def fetch_member_joined_at(guild_id, user_id):
     try:
-        rest_limiter.acquire()
+        limiter = get_rest_limiter(guild_id)
+        limiter.acquire()
         sess = get_session()
-        resp = sess.get(f'https://discord.com/api/v9/guilds/{guildId}/members/{user_id}')
+        resp = sess.get(f'https://discord.com/api/v9/guilds/{guild_id}/members/{user_id}')
         if resp.status_code == 200:
             return resp.json().get('joined_at')
         else:
-            logging.warning(f"API fetch for {user_id} returned {resp.status_code}")
+            logging.warning(f"[Guild {guild_id}] API fetch for {user_id} returned {resp.status_code}")
             return None
     except Exception as e:
-        logging.error(f"Error fetching member {user_id}: {e}")
+        logging.error(f"[Guild {guild_id}] Error fetching member {user_id}: {e}")
         return None
 
 # ---------- Startup webhook check ----------
@@ -685,7 +706,7 @@ def wait_for_webhook_ready():
                     retry_after = wait_time
                 wait_time = max(wait_time, retry_after)
                 logging.warning(f"Webhook rate-limited on startup, waiting {wait_time}s...")
-                time.sleep(wait_time)
+                time.sleep(wait_time + random.uniform(0, 0.5))
                 attempt += 1
                 wait_time = wait_time * 2
                 continue
@@ -716,37 +737,65 @@ def run_health_server():
 
 # ---------- Main ----------
 if __name__ == '__main__':
-    logging.info("Starting snitch (%ds interval, 2-day join window)...", scan_interval)
+    logging.info("Starting multi‑guild snitch (swap interval %ds)...", scan_interval)
     threading.Thread(target=run_health_server, daemon=True).start()
     logging.info("HTTP health check server started on port %s", os.environ.get('PORT', 10000))
 
     webhook_mask = webhook[:40] + "..." if len(webhook) > 40 else webhook
-    logging.info("Configuration: guildId=%s, channels=%s, token starts with %s..., webhook: %s",
-                 guildId, channelIds, token[:8], webhook_mask)
+    logging.info("Configuration: %d guild(s), webhook: %s", len(guild_channel_pairs), webhook_mask)
 
     wait_for_webhook_ready()
 
-    logging.info("Building initial baseline (fetching all members)...")
-    current_members = fetch_all_members(guildId, channelIds)
-    logging.info("Baseline built: %s members visible.", len(current_members))
+    # We'll store previous member dict per guild to diff
+    previous_members = {}  # guild_id -> {user_id: (tag, joined_at)}
 
-    logging.info("Checking baseline members for recent joins...")
-    process_new_members(current_members)
+    # Initial baseline: scan all guilds once
+    for guild_id, channel_id in guild_channel_pairs:
+        logging.info(f"Building initial baseline for guild {guild_id}...")
+        members = fetch_all_members(guild_id, channel_id)
+        if members:
+            previous_members[guild_id] = members
+            logging.info(f"Baseline for guild {guild_id}: {len(members)} members.")
+            # Process initial members (they might have joined recently)
+            process_new_members(guild_id, members)
+        else:
+            logging.warning(f"Failed to fetch initial members for guild {guild_id}. Skipping.")
+            previous_members[guild_id] = {}
+        # Wait between initial scans too
+        if guild_id != guild_channel_pairs[-1][0]:
+            logging.info(f"Waiting {scan_interval}s before next guild initial scan...")
+            time.sleep(scan_interval + random.uniform(0, 10))
 
+    # Main rotation loop
     while True:
-        time.sleep(random.uniform(0, 5))
-        logging.info("Fetching member list...")
-        new_members = fetch_all_members(guildId, channelIds)
-        logging.info("Fetched: %s members visible.", len(new_members))
+        for guild_id, channel_id in guild_channel_pairs:
+            logging.info(f"Scanning guild {guild_id} (channel {channel_id})...")
+            current_members = fetch_all_members(guild_id, channel_id)
+            if current_members is None:
+                logging.error(f"Failed to fetch members for guild {guild_id}. Skipping this cycle.")
+                # Keep old data, but wait before next guild
+                time.sleep(scan_interval + random.uniform(0, 10))
+                continue
 
-        current_ids = set(current_members.keys())
-        new_ids = set(new_members.keys())
-        diff_ids = new_ids - current_ids
-        if diff_ids:
-            diff_dict = {uid: new_members[uid] for uid in diff_ids}
-            logging.info("Found %s new IDs not in previous scan.", len(diff_dict))
-            process_new_members(diff_dict)
+            prev = previous_members.get(guild_id, {})
+            prev_ids = set(prev.keys())
+            curr_ids = set(current_members.keys())
+            diff_ids = curr_ids - prev_ids
+            if diff_ids:
+                diff_dict = {uid: current_members[uid] for uid in diff_ids}
+                logging.info(f"[Guild {guild_id}] Found {len(diff_dict)} new IDs not in previous scan.")
+                process_new_members(guild_id, diff_dict)
+            else:
+                logging.info(f"[Guild {guild_id}] No new members detected.")
 
-        current_members = new_members
-        logging.info("Sleeping %s seconds...", scan_interval)
-        time.sleep(scan_interval)
+            # Update stored members for this guild
+            previous_members[guild_id] = current_members
+
+            # Wait before moving to next guild (unless it's the last one)
+            if guild_id != guild_channel_pairs[-1][0]:
+                logging.info(f"Waiting {scan_interval}s before moving to next guild...")
+                time.sleep(scan_interval + random.uniform(0, 10))
+
+        # After finishing all guilds, the loop starts over from the first
+        logging.info("Completed a full cycle. Starting over after a short jitter...")
+        time.sleep(random.uniform(5, 30))  # extra random delay before next cycle
